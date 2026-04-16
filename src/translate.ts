@@ -233,9 +233,9 @@ function translateContent(
       }
     }
   }
-  return blocks.length === 1 && blocks[0].type === "text"
-    ? blocks[0].text
-    : blocks;
+  if (blocks.length === 0) return "";
+  if (blocks.length === 1 && blocks[0].type === "text") return blocks[0].text;
+  return blocks;
 }
 
 function translateAssistant(

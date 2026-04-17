@@ -118,12 +118,17 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
         );
       }
       try {
-        const parsed = JSON.parse(stdout);
+        // Sanitize raw control characters (CLI emits literal \n inside JSON strings)
+        const sanitized = stdout.replace(
+          /[\x00-\x1f\x7f]/g,
+          (ch) => ch === "\n" || ch === "\r" || ch === "\t" ? ch : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+        );
+        const parsed = JSON.parse(sanitized);
         resolve({
           text: parsed.result ?? "",
           toolCalls: [],
-          inputTokens: parsed.input_tokens ?? 0,
-          outputTokens: parsed.output_tokens ?? 0,
+          inputTokens: parsed.input_tokens ?? parsed.usage?.input_tokens ?? 0,
+          outputTokens: parsed.output_tokens ?? parsed.usage?.output_tokens ?? 0,
           stopReason: parsed.stop_reason ?? "end_turn",
         });
       } catch {
@@ -295,6 +300,9 @@ function buildArgs(
     "1",
     "--tools",
     "",
+    // Disable all MCP servers so they don't interfere with our tool definitions
+    "--strict-mcp-config",
+    '{"mcpServers":{}}',
   ];
 
   if (outputFormat === "stream-json") {

@@ -131,7 +131,7 @@ async function handleChatCompletions(
   }
 
   const model = resolveModel(oaiReq.model ?? "claude-sonnet-4");
-  const prompt = buildPrompt(oaiReq);
+  const built = buildPrompt(oaiReq);
   const startTime = Date.now();
 
   log("info", "Request", {
@@ -140,31 +140,27 @@ async function handleChatCompletions(
     stream: !!oaiReq.stream,
     messages: oaiReq.messages.length,
     tools: oaiReq.tools?.length ?? 0,
+    hasSystemPrompt: !!built.systemPrompt,
   });
 
+  const cliReq = {
+    prompt: built.prompt,
+    model: model.cliAlias,
+    systemPrompt: built.systemPrompt,
+  };
   const hasTools = (oaiReq.tools?.length ?? 0) > 0;
 
   try {
     if (oaiReq.stream && !hasTools) {
-      // True streaming only when no tools (tool responses need buffering to parse XML)
-      const generator = await enqueueRequest(
-        { prompt, model: model.cliAlias },
-        true,
-      );
+      const generator = await enqueueRequest(cliReq, true);
       await handleStreaming(res, generator, model.id, startTime);
     } else if (oaiReq.stream && hasTools) {
-      // Buffer the full response, parse tool calls, then emit as SSE
-      const result = await enqueueRequest(
-        { prompt, model: model.cliAlias },
-        false,
+      const result = await enqueueRequest(cliReq, false,
       );
       const parsed = parseToolCallsFromText(result.text);
       await emitBufferedAsSSE(res, parsed, model.id, result, startTime);
     } else {
-      const result = await enqueueRequest(
-        { prompt, model: model.cliAlias },
-        false,
-      );
+      const result = await enqueueRequest(cliReq, false);
       const duration = Date.now() - startTime;
       log("info", "Response", {
         model: model.id,

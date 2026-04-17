@@ -44,18 +44,58 @@ export interface OAIChatRequest {
   user?: string;
 }
 
-// ─── Prompt Building (OpenAI messages → text for CLI) ───────────────────────
+// ─── Prompt Building ────────────────────────────────────────────────────────
 
-export function buildPrompt(oai: OAIChatRequest): string {
-  const parts: string[] = [];
+export interface BuiltPrompt {
+  prompt: string;
+  systemPrompt: string | undefined;
+}
 
+export function buildPrompt(oai: OAIChatRequest): BuiltPrompt {
+  const systemParts: string[] = [];
+  const conversationParts: string[] = [];
+
+  // Extract system messages and tool definitions into systemPrompt
+  for (const msg of oai.messages) {
+    if (msg.role === "system") {
+      systemParts.push(extractText(msg.content));
+    }
+  }
+
+  // Add tool definitions to system prompt (authoritative, not user text)
+  if (oai.tools?.length) {
+    const toolDefs = oai.tools
+      .map((t) => {
+        const fn = t.function;
+        return `- ${fn.name}: ${fn.description ?? ""}\n  Parameters: ${JSON.stringify(fn.parameters ?? {})}`;
+      })
+      .join("\n");
+    systemParts.push(
+      [
+        "<tools>",
+        "You have access to the following tools and MUST use them when appropriate.",
+        "To call a tool, output EXACTLY a <tool_call> XML tag with JSON inside.",
+        "Format: <tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>",
+        "",
+        "CRITICAL RULES:",
+        "- Output NOTHING after the closing </tool_call> tag. No explanation, no commentary. STOP immediately.",
+        "- If you need multiple tool calls, output each on its own line.",
+        "- Do NOT output <tool_result> tags — those come from the system, not from you.",
+        "",
+        toolDefs,
+        "</tools>",
+      ].join("\n"),
+    );
+  }
+
+  // Build conversation prompt (user, assistant, tool messages only)
   for (const msg of oai.messages) {
     switch (msg.role) {
       case "system":
-        parts.push(`<system>${extractText(msg.content)}</system>`);
+        // Already handled above
         break;
       case "user":
-        parts.push(extractText(msg.content));
+        conversationParts.push(extractText(msg.content));
         break;
       case "assistant": {
         const text = extractText(msg.content);
@@ -69,32 +109,24 @@ export function buildPrompt(oai: OAIChatRequest): string {
         }
         const combined = [text, ...toolParts].filter(Boolean).join("\n");
         if (combined) {
-          parts.push(`<previous_response>${combined}</previous_response>`);
+          conversationParts.push(
+            `<previous_response>${combined}</previous_response>`,
+          );
         }
         break;
       }
       case "tool":
-        parts.push(
+        conversationParts.push(
           `<tool_result tool_call_id="${msg.tool_call_id ?? ""}">${extractText(msg.content)}</tool_result>`,
         );
         break;
     }
   }
 
-  // Inject tool definitions if present
-  if (oai.tools?.length) {
-    const toolDefs = oai.tools
-      .map((t) => {
-        const fn = t.function;
-        return `- ${fn.name}: ${fn.description ?? ""}\n  Parameters: ${JSON.stringify(fn.parameters ?? {})}`;
-      })
-      .join("\n");
-    parts.unshift(
-      `<tools>\nYou have access to the following tools and MUST use them when appropriate.\nTo call a tool, output EXACTLY a <tool_call> XML tag with JSON inside. Output NOTHING after the tool call tag — no explanation, no commentary. STOP immediately after closing the tag.\nIf you need multiple tool calls, output each on its own line.\nFormat: <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n\n${toolDefs}\n</tools>`,
-    );
-  }
-
-  return parts.join("\n\n");
+  return {
+    prompt: conversationParts.join("\n\n"),
+    systemPrompt: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
+  };
 }
 
 export function extractText(content: OAIMessage["content"]): string {
@@ -108,13 +140,6 @@ export function extractText(content: OAIMessage["content"]): string {
   return String(content ?? "");
 }
 
-export function translateToolChoice(
-  _choice: string | { type: string; function?: { name: string } },
-): string {
-  // Placeholder — CLI doesn't support tool_choice directly
-  return "auto";
-}
-
 // ─── Tool Call Parsing (from CLI text response) ─────────────────────────────
 
 const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
@@ -126,7 +151,7 @@ export interface ParsedToolCall {
 }
 
 export interface ParsedResponse {
-  text: string;
+  text: string | null;
   toolCalls: ParsedToolCall[];
 }
 
@@ -143,19 +168,23 @@ export function parseToolCallsFromText(raw: string): ParsedResponse {
       toolCalls.push({
         id: `call_${Date.now()}_${toolCallCounter++}`,
         name: parsed.name,
-        arguments: typeof parsed.arguments === "string"
-          ? parsed.arguments
-          : JSON.stringify(parsed.arguments ?? {}),
+        arguments:
+          typeof parsed.arguments === "string"
+            ? parsed.arguments
+            : JSON.stringify(parsed.arguments ?? {}),
       });
     } catch {
-      // malformed tool call, leave in text
       continue;
     }
     text = text.replace(match[0], "");
   }
 
-  // Clean up leftover whitespace
-  text = text.trim();
+  // If tool calls were found, discard ALL remaining text.
+  // The model sometimes adds commentary after tool calls — strip it.
+  if (toolCalls.length > 0) {
+    return { text: null, toolCalls };
+  }
 
-  return { text: text || null!, toolCalls };
+  text = text.trim();
+  return { text: text || null, toolCalls };
 }

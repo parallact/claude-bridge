@@ -284,6 +284,10 @@ function buildArgs(
     "--model",
     request.model,
     "--no-session-persistence",
+    "--max-turns",
+    "1",
+    "--tools",
+    "",
   ];
 
   if (outputFormat === "stream-json") {

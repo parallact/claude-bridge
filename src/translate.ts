@@ -90,7 +90,7 @@ export function buildPrompt(oai: OAIChatRequest): string {
       })
       .join("\n");
     parts.unshift(
-      `<tools>\nYou have access to the following tools. To call a tool, output a <tool_call> XML tag with JSON inside.\nFormat: <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n\n${toolDefs}\n</tools>`,
+      `<tools>\nYou have access to the following tools and MUST use them when appropriate.\nTo call a tool, output EXACTLY a <tool_call> XML tag with JSON inside. Output NOTHING after the tool call tag — no explanation, no commentary. STOP immediately after closing the tag.\nIf you need multiple tool calls, output each on its own line.\nFormat: <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n\n${toolDefs}\n</tools>`,
     );
   }
 
@@ -113,4 +113,49 @@ export function translateToolChoice(
 ): string {
   // Placeholder — CLI doesn't support tool_choice directly
   return "auto";
+}
+
+// ─── Tool Call Parsing (from CLI text response) ─────────────────────────────
+
+const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+
+export interface ParsedToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface ParsedResponse {
+  text: string;
+  toolCalls: ParsedToolCall[];
+}
+
+let toolCallCounter = 0;
+
+export function parseToolCallsFromText(raw: string): ParsedResponse {
+  const toolCalls: ParsedToolCall[] = [];
+  let text = raw;
+
+  for (const match of raw.matchAll(TOOL_CALL_RE)) {
+    const json = match[1];
+    try {
+      const parsed = JSON.parse(json);
+      toolCalls.push({
+        id: `call_${Date.now()}_${toolCallCounter++}`,
+        name: parsed.name,
+        arguments: typeof parsed.arguments === "string"
+          ? parsed.arguments
+          : JSON.stringify(parsed.arguments ?? {}),
+      });
+    } catch {
+      // malformed tool call, leave in text
+      continue;
+    }
+    text = text.replace(match[0], "");
+  }
+
+  // Clean up leftover whitespace
+  text = text.trim();
+
+  return { text: text || null!, toolCalls };
 }

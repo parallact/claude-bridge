@@ -151,12 +151,11 @@ async function handleChatCompletions(
   try {
     if (oaiReq.stream) {
       // All streaming is buffered — SDK/CLI return complete responses
-      const result = await enqueueRequest(cliReq, false,
-      );
+      const result = await enqueueRequest(cliReq);
       const parsed = parseToolCallsFromText(result.text);
       await emitBufferedAsSSE(res, parsed, model.id, result, startTime);
     } else {
-      const result = await enqueueRequest(cliReq, false);
+      const result = await enqueueRequest(cliReq);
       const duration = Date.now() - startTime;
       log("info", "Response", {
         model: model.id,

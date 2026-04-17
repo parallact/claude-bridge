@@ -201,10 +201,17 @@ function parseStreamLine(line: string): CLIStreamEvent | null {
   try {
     const data = JSON.parse(line);
 
-    // Claude CLI stream-json emits various event types
+    // Claude CLI stream-json emits assistant messages with full content
     if (data.type === "assistant" && data.message?.content) {
-      // Final message with full content
-      return null; // We handle deltas, not the final message
+      const content = data.message.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === "text" && block.text) {
+            return { type: "text", text: block.text };
+          }
+        }
+      }
+      return null;
     }
 
     if (data.type === "content_block_delta") {

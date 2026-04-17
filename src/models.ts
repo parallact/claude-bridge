@@ -20,8 +20,8 @@ const MODELS: BridgeModel[] = [
   },
   {
     id: "claude-sonnet-4",
-    anthropicId: "claude-sonnet-4-5-20250514",
-    name: "Claude Sonnet 4.5",
+    anthropicId: "claude-sonnet-4-20250514",
+    name: "Claude Sonnet 4",
     contextWindow: 200_000,
     maxOutputTokens: 16_384,
     supportsTools: true,

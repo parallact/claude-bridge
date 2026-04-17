@@ -228,7 +228,9 @@ export class AnthropicError extends Error {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function isRetryable(status: number): boolean {
-  return status === 429 || status === 529 || (status >= 500 && status < 600);
+  // Do NOT retry 429 — subscription rate limits have rolling windows,
+  // and retrying makes them worse. Let the caller (OpenClaw) handle backoff.
+  return status === 529 || (status >= 500 && status < 600);
 }
 
 function getRetryDelay(resp: Response, attempt: number): number {

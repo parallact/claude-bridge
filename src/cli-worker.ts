@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 export interface CLIRequest {
-  prompt: string;
+  prompt: string;       // Full conversation (for new sessions)
+  lastMessage: string;  // Just the latest user message (for resumed sessions)
   model: string;
   systemPrompt?: string;
   hasTools: boolean;
+  sessionKey?: string;  // OpenClaw session identifier (from "user" field)
 }
 
 export interface CLIResult {
@@ -12,6 +15,7 @@ export interface CLIResult {
   inputTokens: number;
   outputTokens: number;
   stopReason: string;
+  sessionId: string;
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -26,7 +30,29 @@ export function configurePool(config: WorkerPoolConfig): void {
   poolConfig = config;
 }
 
-// ─── Request Queue ──────────────────────────────────────────────────────────
+// ─── Session Management ─────────────────────────────────────────────────────
+// Maps OpenClaw session keys to CLI session UUIDs.
+// First request creates a new session, subsequent requests resume it.
+
+const sessions = new Map<string, string>();
+
+function getOrCreateSessionId(sessionKey: string | undefined): {
+  sessionId: string;
+  isNew: boolean;
+} {
+  if (!sessionKey) {
+    return { sessionId: randomUUID(), isNew: true };
+  }
+  const existing = sessions.get(sessionKey);
+  if (existing) {
+    return { sessionId: existing, isNew: false };
+  }
+  const sessionId = randomUUID();
+  sessions.set(sessionKey, sessionId);
+  return { sessionId, isNew: true };
+}
+
+// ─── Request Execution ──────────────────────────────────────────────────────
 
 let activeRequests = 0;
 
@@ -39,16 +65,15 @@ export function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
   });
 }
 
-// ─── CLI Execution ──────────────────────────────────────────────────────────
-
 function runCLI(request: CLIRequest): Promise<CLIResult> {
+  const { sessionId, isNew } = getOrCreateSessionId(request.sessionKey);
+
   const args = [
     "--print",
     "--output-format",
     "json",
     "--model",
     request.model,
-    "--no-session-persistence",
     "--max-turns",
     "1",
     "--tools",
@@ -57,9 +82,26 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
     '{"mcpServers":{}}',
   ];
 
-  if (request.systemPrompt) {
-    args.push("--system-prompt", request.systemPrompt);
+  if (isNew) {
+    // New session: pass session ID, system prompt, full context
+    args.push("--session-id", sessionId);
+    if (request.systemPrompt) {
+      args.push("--system-prompt", request.systemPrompt);
+    }
+  } else {
+    // Resume existing session: only send the new message
+    args.push("--resume", sessionId);
   }
+
+  // New sessions get the full prompt, resumed sessions only get the last message
+  const promptToSend = isNew ? request.prompt : request.lastMessage;
+
+  log("info", "CLI spawn", {
+    sessionId: sessionId.slice(0, 8),
+    isNew,
+    model: request.model,
+    promptLen: promptToSend.length,
+  });
 
   return new Promise((resolve, reject) => {
     const proc = spawn("claude", args, {
@@ -67,7 +109,7 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    proc.stdin?.write(request.prompt);
+    proc.stdin?.write(promptToSend);
     proc.stdin?.end();
 
     let stdout = "";
@@ -75,6 +117,8 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
 
     const timer = setTimeout(() => {
       proc.kill("SIGKILL");
+      // If session timed out, remove it so next request creates fresh
+      if (request.sessionKey) sessions.delete(request.sessionKey);
       reject(new Error(`CLI timeout after ${poolConfig.timeoutMs}ms`));
     }, poolConfig.timeoutMs);
 
@@ -88,12 +132,13 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
     proc.on("close", (code) => {
       clearTimeout(timer);
       if (code !== 0) {
+        // If CLI failed, remove session so next request starts fresh
+        if (request.sessionKey) sessions.delete(request.sessionKey);
         return reject(
           new Error(`CLI exited ${code}: ${stderr.slice(0, 500)}`),
         );
       }
       try {
-        // Sanitize control characters in CLI JSON output
         const sanitized = stdout.replace(
           /[\x00-\x1f\x7f]/g,
           (ch) =>
@@ -108,6 +153,7 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
           outputTokens:
             parsed.output_tokens ?? parsed.usage?.output_tokens ?? 0,
           stopReason: parsed.stop_reason ?? "end_turn",
+          sessionId,
         });
       } catch {
         resolve({
@@ -115,12 +161,14 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
           inputTokens: 0,
           outputTokens: 0,
           stopReason: "end_turn",
+          sessionId,
         });
       }
     });
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if (request.sessionKey) sessions.delete(request.sessionKey);
       reject(err);
     });
   });

@@ -141,11 +141,28 @@ async function handleChatCompletions(
   });
 
   const hasTools = (oaiReq.tools?.length ?? 0) > 0;
+
+  // Extract just the last user message for resumed sessions.
+  // The CLI already has the conversation history from the session.
+  const lastUserMsg = oaiReq.messages.filter((m) => m.role === "user").pop();
+  const lastUserText = lastUserMsg
+    ? (typeof lastUserMsg.content === "string"
+        ? lastUserMsg.content
+        : Array.isArray(lastUserMsg.content)
+          ? lastUserMsg.content
+              .filter((p) => p.type === "text")
+              .map((p) => p.text ?? "")
+              .join("")
+          : String(lastUserMsg.content ?? ""))
+    : built.prompt;
+
   const cliReq = {
     prompt: built.prompt,
+    lastMessage: lastUserText,
     model: model.cliAlias,
     systemPrompt: built.systemPrompt,
     hasTools,
+    sessionKey: oaiReq.user,
   };
 
   try {

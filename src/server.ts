@@ -1,24 +1,19 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
-  callAnthropic,
-  callAnthropicStream,
-  parseSSEStream,
-  AnthropicError,
-} from "./anthropic.js";
-import { resolveModel, listModels } from "./models.js";
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import { listModels, resolveModel } from "./models.js";
 import {
-  translateRequest,
-  translateResponse,
-  translateStreamEvent,
-  createStreamState,
-  type OAIChatRequest,
-} from "./translate.js";
+  enqueueRequest,
+  type CLIStreamEvent,
+} from "./cli-worker.js";
+import type { OAIChatRequest } from "./translate.js";
+import { extractText, buildPrompt, translateToolChoice } from "./translate.js";
 
 export interface ServerConfig {
   port: number;
   host: string;
-  apiKey: string;
-  timeoutMs: number;
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
@@ -26,7 +21,7 @@ export interface ServerConfig {
 export function startServer(config: ServerConfig): void {
   const server = createServer(async (req, res) => {
     try {
-      await handleRequest(req, res, config);
+      await handleRequest(req, res);
     } catch (err) {
       log("error", "Unhandled error", {
         error: err instanceof Error ? err.message : String(err),
@@ -43,7 +38,6 @@ export function startServer(config: ServerConfig): void {
     }
   });
 
-  // Graceful shutdown
   const shutdown = () => {
     log("info", "Shutting down...");
     server.close(() => process.exit(0));
@@ -53,20 +47,20 @@ export function startServer(config: ServerConfig): void {
   process.on("SIGINT", shutdown);
 
   server.listen(config.port, config.host, () => {
-    log("info", `Claude Bridge listening on http://${config.host}:${config.port}`);
+    log(
+      "info",
+      `Claude Bridge listening on http://${config.host}:${config.port}`,
+    );
     log("info", `Models: ${listModels().map((m) => m.id).join(", ")}`);
-    log("info", `Timeout: ${config.timeoutMs}ms`);
   });
 }
 
-// ─── Request Router ─────────────────────────────────────────────────────────
+// ─── Router ─────────────────────────────────────────────────────────────────
 
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  config: ServerConfig,
 ): Promise<void> {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -80,7 +74,7 @@ async function handleRequest(
   const url = req.url ?? "/";
 
   if (url === "/health" || url === "/healthz") {
-    return sendJson(res, 200, { status: "ok", version: "1.0.0" });
+    return sendJson(res, 200, { status: "ok", version: "2.0.0" });
   }
 
   if (url === "/v1/models" && req.method === "GET") {
@@ -88,7 +82,7 @@ async function handleRequest(
   }
 
   if (url === "/v1/chat/completions" && req.method === "POST") {
-    return handleChatCompletions(req, res, config);
+    return handleChatCompletions(req, res);
   }
 
   sendJson(res, 404, {
@@ -104,9 +98,6 @@ function handleModels(res: ServerResponse): void {
     object: "model",
     created: 1700000000,
     owned_by: "anthropic",
-    permission: [],
-    root: m.anthropicId,
-    parent: null,
   }));
   sendJson(res, 200, { object: "list", data: models });
 }
@@ -116,7 +107,6 @@ function handleModels(res: ServerResponse): void {
 async function handleChatCompletions(
   req: IncomingMessage,
   res: ServerResponse,
-  config: ServerConfig,
 ): Promise<void> {
   const body = await readBody(req);
   if (!body) {
@@ -141,13 +131,12 @@ async function handleChatCompletions(
   }
 
   const model = resolveModel(oaiReq.model ?? "claude-sonnet-4");
-  const anthropicReq = translateRequest(oaiReq, model.anthropicId);
-  const clientConfig = { apiKey: config.apiKey, timeoutMs: config.timeoutMs };
-
+  const prompt = buildPrompt(oaiReq);
   const startTime = Date.now();
+
   log("info", "Request", {
     model: model.id,
-    anthropicModel: model.anthropicId,
+    cliModel: model.cliAlias,
     stream: !!oaiReq.stream,
     messages: oaiReq.messages.length,
     tools: oaiReq.tools?.length ?? 0,
@@ -155,75 +144,65 @@ async function handleChatCompletions(
 
   try {
     if (oaiReq.stream) {
-      await handleStreaming(res, clientConfig, anthropicReq, model.id, startTime);
+      const generator = await enqueueRequest(
+        { prompt, model: model.cliAlias },
+        true,
+      );
+      await handleStreaming(res, generator, model.id, startTime);
     } else {
-      await handleNonStreaming(res, clientConfig, anthropicReq, model.id, startTime);
+      const result = await enqueueRequest(
+        { prompt, model: model.cliAlias },
+        false,
+      );
+      const duration = Date.now() - startTime;
+      log("info", "Response", {
+        model: model.id,
+        duration,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+      });
+
+      sendJson(res, 200, {
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model.id,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: result.text },
+            finish_reason: result.stopReason === "end_turn" ? "stop" : result.stopReason,
+          },
+        ],
+        usage: {
+          prompt_tokens: result.inputTokens,
+          completion_tokens: result.outputTokens,
+          total_tokens: result.inputTokens + result.outputTokens,
+        },
+      });
     }
   } catch (err) {
     const duration = Date.now() - startTime;
-    if (err instanceof AnthropicError) {
-      log("error", "Anthropic error", {
-        status: err.status,
-        duration,
-        model: model.id,
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", "Request failed", { model: model.id, duration, error: message });
+
+    if (!res.headersSent) {
+      const isTimeout = message.includes("timeout");
+      sendJson(res, isTimeout ? 504 : 500, {
+        error: { message, type: "api_error", code: null },
       });
-      if (!res.headersSent) {
-        sendJson(res, err.status || 500, err.toOpenAIError());
-      }
-    } else {
-      log("error", "Request failed", {
-        error: err instanceof Error ? err.message : String(err),
-        duration,
-        model: model.id,
-      });
-      if (!res.headersSent) {
-        sendJson(res, 500, {
-          error: {
-            message: err instanceof Error ? err.message : "Unknown error",
-            type: "api_error",
-            code: null,
-          },
-        });
-      }
     }
   }
-}
-
-// ─── Non-Streaming Handler ──────────────────────────────────────────────────
-
-async function handleNonStreaming(
-  res: ServerResponse,
-  config: { apiKey: string; timeoutMs: number },
-  anthropicReq: import("./translate.js").AnthropicRequest,
-  requestModel: string,
-  startTime: number,
-): Promise<void> {
-  const anthropicResp = await callAnthropic(config, anthropicReq);
-  const oaiResp = translateResponse(anthropicResp, requestModel);
-  const duration = Date.now() - startTime;
-
-  log("info", "Response", {
-    model: requestModel,
-    duration,
-    inputTokens: anthropicResp.usage.input_tokens,
-    outputTokens: anthropicResp.usage.output_tokens,
-    finishReason: anthropicResp.stop_reason,
-  });
-
-  sendJson(res, 200, oaiResp);
 }
 
 // ─── Streaming Handler ──────────────────────────────────────────────────────
 
 async function handleStreaming(
   res: ServerResponse,
-  config: { apiKey: string; timeoutMs: number },
-  anthropicReq: import("./translate.js").AnthropicRequest,
+  generator: AsyncGenerator<CLIStreamEvent>,
   requestModel: string,
   startTime: number,
 ): Promise<void> {
-  const rawResp = await callAnthropicStream(config, anthropicReq);
-
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -231,39 +210,107 @@ async function handleStreaming(
     "X-Accel-Buffering": "no",
   });
 
-  const state = createStreamState(requestModel);
-  let lastUsage: Record<string, unknown> | null = null;
-
-  // Detect client disconnect
+  const msgId = `chatcmpl-${Date.now()}`;
+  const ts = Math.floor(Date.now() / 1000);
+  let toolCallIndex = -1;
   let clientDisconnected = false;
+
   res.on("close", () => {
     clientDisconnected = true;
   });
 
+  // Initial role chunk
+  writeSSE(res, {
+    id: msgId,
+    object: "chat.completion.chunk",
+    created: ts,
+    model: requestModel,
+    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+  });
+
   try {
-    for await (const sse of parseSSEStream(rawResp)) {
+    for await (const event of generator) {
       if (clientDisconnected) break;
 
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(sse.data);
-      } catch {
-        continue;
-      }
+      switch (event.type) {
+        case "text":
+          writeSSE(res, {
+            id: msgId,
+            object: "chat.completion.chunk",
+            created: ts,
+            model: requestModel,
+            choices: [{ index: 0, delta: { content: event.text }, finish_reason: null }],
+          });
+          break;
 
-      // Capture usage from message_start and message_delta
-      if (sse.event === "message_start") {
-        const msg = parsed.message as Record<string, unknown> | undefined;
-        lastUsage = (msg?.usage as Record<string, unknown>) ?? null;
-      }
-      if (sse.event === "message_delta") {
-        const deltaUsage = parsed.usage as Record<string, unknown> | undefined;
-        if (deltaUsage) lastUsage = { ...lastUsage, ...deltaUsage };
-      }
+        case "tool_call_start":
+          toolCallIndex++;
+          writeSSE(res, {
+            id: msgId,
+            object: "chat.completion.chunk",
+            created: ts,
+            model: requestModel,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: toolCallIndex,
+                  id: event.toolCall!.id,
+                  type: "function",
+                  function: { name: event.toolCall!.name, arguments: "" },
+                }],
+              },
+              finish_reason: null,
+            }],
+          });
+          break;
 
-      const chunk = translateStreamEvent(sse.event, parsed, state);
-      if (chunk) {
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        case "tool_call_delta":
+          writeSSE(res, {
+            id: msgId,
+            object: "chat.completion.chunk",
+            created: ts,
+            model: requestModel,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: event.toolCallIndex ?? toolCallIndex,
+                  function: { arguments: event.text },
+                }],
+              },
+              finish_reason: null,
+            }],
+          });
+          break;
+
+        case "stop": {
+          const finishReason =
+            event.stopReason === "tool_use"
+              ? "tool_calls"
+              : event.stopReason === "max_tokens"
+                ? "length"
+                : "stop";
+          writeSSE(res, {
+            id: msgId,
+            object: "chat.completion.chunk",
+            created: ts,
+            model: requestModel,
+            choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          });
+
+          const duration = Date.now() - startTime;
+          log("info", "Stream complete", {
+            model: requestModel,
+            duration,
+            ...event.usage,
+          });
+          break;
+        }
+
+        case "error":
+          log("error", "Stream error", { error: event.error });
+          break;
       }
     }
   } finally {
@@ -271,35 +318,25 @@ async function handleStreaming(
       res.write("data: [DONE]\n\n");
       res.end();
     }
-
-    const duration = Date.now() - startTime;
-    log("info", "Stream complete", {
-      model: requestModel,
-      duration,
-      ...(lastUsage ?? {}),
-    });
   }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function writeSSE(res: ServerResponse, data: unknown): void {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
 function readBody(req: IncomingMessage): Promise<string | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
-      const body = Buffer.concat(chunks).toString("utf-8");
-      resolve(body || null);
-    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8") || null));
     req.on("error", () => resolve(null));
   });
 }
 
-function sendJson(
-  res: ServerResponse,
-  status: number,
-  data: unknown,
-): void {
+function sendJson(res: ServerResponse, status: number, data: unknown): void {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     "Content-Type": "application/json",

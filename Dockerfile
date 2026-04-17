@@ -6,6 +6,9 @@ COPY src/ src/
 RUN npx tsc
 
 FROM node:22-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://raw.githubusercontent.com/anthropics/claude-code/main/install.sh | bash
 WORKDIR /app
 COPY --from=builder /app/dist/ dist/
 COPY package.json ./

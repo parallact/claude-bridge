@@ -1,30 +1,22 @@
 import { startServer } from "./server.js";
+import { configurePool } from "./cli-worker.js";
 
-const config = {
-  port: parseInt(process.env.CLAUDE_BRIDGE_PORT ?? "3456", 10),
-  host: process.env.CLAUDE_BRIDGE_HOST ?? "0.0.0.0",
-  apiKey: process.env.ANTHROPIC_API_KEY ?? process.env.CLAUDE_OAUTH_TOKEN ?? "",
-  timeoutMs: parseInt(process.env.CLAUDE_BRIDGE_TIMEOUT_MS ?? "300000", 10),
-};
+const port = parseInt(process.env.CLAUDE_BRIDGE_PORT ?? "3456", 10);
+const host = process.env.CLAUDE_BRIDGE_HOST ?? "0.0.0.0";
+const maxWorkers = parseInt(process.env.CLAUDE_BRIDGE_MAX_WORKERS ?? "5", 10);
+const timeoutMs = parseInt(process.env.CLAUDE_BRIDGE_TIMEOUT_MS ?? "300000", 10);
 
-if (!config.apiKey) {
-  process.stderr.write(
-    "ERROR: ANTHROPIC_API_KEY or CLAUDE_OAUTH_TOKEN must be set.\n" +
-      "This should be your Claude Max OAuth token (sk-ant-oat01-...).\n" +
-      "Extract from macOS keychain:\n" +
-      '  security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w | python3 -c "import sys,json; print(json.loads(sys.stdin.read())[\'claudeAiOauth\'][\'accessToken\'])"\n',
-  );
-  process.exit(1);
-}
+configurePool({ maxWorkers, timeoutMs });
 
 console.log("╔══════════════════════════════════════════╗");
-console.log("║        Claude Bridge v1.0.0              ║");
-console.log("║  OpenAI-compatible → Anthropic API       ║");
+console.log("║        Claude Bridge v2.0.0              ║");
+console.log("║  OpenAI-compatible → Claude CLI pool     ║");
 console.log("╚══════════════════════════════════════════╝");
 console.log("");
-console.log(`  Token: ${config.apiKey.slice(0, 15)}...${config.apiKey.slice(-6)}`);
-console.log(`  Bind:  ${config.host}:${config.port}`);
-console.log(`  API:   http://${config.host}:${config.port}/v1/chat/completions`);
+console.log(`  Workers: ${maxWorkers} concurrent`);
+console.log(`  Timeout: ${timeoutMs}ms`);
+console.log(`  Bind:    ${host}:${port}`);
+console.log(`  API:     http://${host}:${port}/v1/chat/completions`);
 console.log("");
 
-startServer(config);
+startServer({ port, host });

@@ -4,10 +4,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { listModels, resolveModel } from "./models.js";
-import {
-  enqueueRequest,
-  type CLIStreamEvent,
-} from "./cli-worker.js";
+import { enqueueRequest } from "./cli-worker.js";
 import type { OAIChatRequest } from "./translate.js";
 import { buildPrompt, parseToolCallsFromText } from "./translate.js";
 
@@ -143,18 +140,17 @@ async function handleChatCompletions(
     hasSystemPrompt: !!built.systemPrompt,
   });
 
+  const hasTools = (oaiReq.tools?.length ?? 0) > 0;
   const cliReq = {
     prompt: built.prompt,
     model: model.cliAlias,
     systemPrompt: built.systemPrompt,
+    hasTools,
   };
-  const hasTools = (oaiReq.tools?.length ?? 0) > 0;
 
   try {
-    if (oaiReq.stream && !hasTools) {
-      const generator = await enqueueRequest(cliReq, true);
-      await handleStreaming(res, generator, model.id, startTime);
-    } else if (oaiReq.stream && hasTools) {
+    if (oaiReq.stream) {
+      // All streaming is buffered — SDK/CLI return complete responses
       const result = await enqueueRequest(cliReq, false,
       );
       const parsed = parseToolCallsFromText(result.text);
@@ -283,131 +279,9 @@ async function emitBufferedAsSSE(
   });
 }
 
-// ─── Streaming Handler ──────────────────────────────────────────────────────
-
-async function handleStreaming(
-  res: ServerResponse,
-  generator: AsyncGenerator<CLIStreamEvent>,
-  requestModel: string,
-  startTime: number,
-): Promise<void> {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  const msgId = `chatcmpl-${Date.now()}`;
-  const ts = Math.floor(Date.now() / 1000);
-  let toolCallIndex = -1;
-  let clientDisconnected = false;
-
-  res.on("close", () => {
-    clientDisconnected = true;
-  });
-
-  // Initial role chunk
-  writeSSE(res, {
-    id: msgId,
-    object: "chat.completion.chunk",
-    created: ts,
-    model: requestModel,
-    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-  });
-
-  try {
-    for await (const event of generator) {
-      if (clientDisconnected) break;
-
-      switch (event.type) {
-        case "text":
-          writeSSE(res, {
-            id: msgId,
-            object: "chat.completion.chunk",
-            created: ts,
-            model: requestModel,
-            choices: [{ index: 0, delta: { content: event.text }, finish_reason: null }],
-          });
-          break;
-
-        case "tool_call_start":
-          toolCallIndex++;
-          writeSSE(res, {
-            id: msgId,
-            object: "chat.completion.chunk",
-            created: ts,
-            model: requestModel,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: toolCallIndex,
-                  id: event.toolCall!.id,
-                  type: "function",
-                  function: { name: event.toolCall!.name, arguments: "" },
-                }],
-              },
-              finish_reason: null,
-            }],
-          });
-          break;
-
-        case "tool_call_delta":
-          writeSSE(res, {
-            id: msgId,
-            object: "chat.completion.chunk",
-            created: ts,
-            model: requestModel,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: event.toolCallIndex ?? toolCallIndex,
-                  function: { arguments: event.text },
-                }],
-              },
-              finish_reason: null,
-            }],
-          });
-          break;
-
-        case "stop": {
-          const finishReason =
-            event.stopReason === "tool_use"
-              ? "tool_calls"
-              : event.stopReason === "max_tokens"
-                ? "length"
-                : "stop";
-          writeSSE(res, {
-            id: msgId,
-            object: "chat.completion.chunk",
-            created: ts,
-            model: requestModel,
-            choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-          });
-
-          const duration = Date.now() - startTime;
-          log("info", "Stream complete", {
-            model: requestModel,
-            duration,
-            ...event.usage,
-          });
-          break;
-        }
-
-        case "error":
-          log("error", "Stream error", { error: event.error });
-          break;
-      }
-    }
-  } finally {
-    if (!clientDisconnected) {
-      res.write("data: [DONE]\n\n");
-      res.end();
-    }
-  }
-}
+// ─── Old streaming handler removed — all responses are buffered now ─────────
+// SDK and CLI both return complete responses. Streaming to client is simulated
+// via emitBufferedAsSSE() which parses tool calls and emits SSE chunks.
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

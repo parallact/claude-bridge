@@ -1,65 +1,106 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { query, startup, type WarmQuery } from "@anthropic-ai/claude-agent-sdk";
 
 export interface CLIRequest {
   prompt: string;
   model: string;
   systemPrompt?: string;
+  hasTools: boolean;
 }
 
 export interface CLIResult {
   text: string;
-  toolCalls: Array<{ name: string; arguments: string; id: string }>;
   inputTokens: number;
   outputTokens: number;
   stopReason: string;
 }
 
 export interface CLIStreamEvent {
-  type: "text" | "tool_call_start" | "tool_call_delta" | "stop" | "error";
+  type: "text" | "stop" | "error";
   text?: string;
-  toolCall?: { id: string; name: string; arguments: string };
-  toolCallIndex?: number;
   stopReason?: string;
   error?: string;
   usage?: { inputTokens: number; outputTokens: number };
 }
 
-// ─── Worker Pool ────────────────────────────────────────────────────────────
+// ─── Hybrid Worker Pool ─────────────────────────────────────────────────────
+// SDK pre-warmed workers for simple requests (fast, no tool support)
+// CLI spawn for tool-calling requests (supports --system-prompt)
 
 export interface WorkerPoolConfig {
-  maxWorkers: number;
+  poolSize: number;
   timeoutMs: number;
 }
 
-interface QueueItem {
-  request: CLIRequest;
-  streaming: boolean;
-  resolve: (value: CLIResult | AsyncGenerator<CLIStreamEvent>) => void;
-  reject: (error: Error) => void;
-}
-
-let activeWorkers = 0;
-const queue: QueueItem[] = [];
-let poolConfig: WorkerPoolConfig = { maxWorkers: 5, timeoutMs: 300_000 };
+let poolConfig: WorkerPoolConfig = { poolSize: 10, timeoutMs: 300_000 };
+const warmPool: WarmQuery[] = [];
+let warming = false;
 
 export function configurePool(config: WorkerPoolConfig): void {
   poolConfig = config;
 }
 
+async function fillPool(): Promise<void> {
+  if (warming) return;
+  warming = true;
+  try {
+    while (warmPool.length < poolConfig.poolSize) {
+      try {
+        const warm = await startup({
+          options: {
+            model: "sonnet",
+            permissionMode: "bypassPermissions" as "default",
+            allowDangerouslySkipPermissions: true,
+          },
+          initializeTimeoutMs: 30_000,
+        });
+        warmPool.push(warm);
+        log("debug", "SDK worker pre-warmed", { poolSize: warmPool.length });
+      } catch (err) {
+        log("warn", "Failed to pre-warm SDK worker", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        break;
+      }
+    }
+  } finally {
+    warming = false;
+  }
+}
+
+export async function initPool(): Promise<void> {
+  log("info", "Pre-warming SDK worker pool", { target: poolConfig.poolSize });
+  await fillPool();
+  log("info", "Worker pool ready", { size: warmPool.length });
+}
+
+// ─── Request Queue ──────────────────────────────────────────────────────────
+
+let activeRequests = 0;
+
+interface QueueItem {
+  request: CLIRequest;
+  streaming: boolean;
+  resolve: (value: CLIResult) => void;
+  reject: (error: Error) => void;
+}
+
+const queue: QueueItem[] = [];
+
 function tryProcessQueue(): void {
-  while (queue.length > 0 && activeWorkers < poolConfig.maxWorkers) {
+  while (queue.length > 0) {
     const item = queue.shift()!;
-    activeWorkers++;
+    activeRequests++;
 
-    const work = item.streaming
-      ? runCLIStream(item.request)
-      : runCLI(item.request);
+    const work = item.request.hasTools
+      ? runCLI(item.request)  // CLI spawn for tool-calling (supports --system-prompt)
+      : runSDK(item.request); // SDK for simple requests (pre-warmed, fast)
 
-    work
+    (work as Promise<CLIResult>)
       .then(item.resolve)
       .catch(item.reject)
       .finally(() => {
-        activeWorkers--;
+        activeRequests--;
         tryProcessQueue();
       });
   }
@@ -67,34 +108,103 @@ function tryProcessQueue(): void {
 
 export function enqueueRequest(
   request: CLIRequest,
-  streaming: false,
-): Promise<CLIResult>;
-export function enqueueRequest(
-  request: CLIRequest,
-  streaming: true,
-): Promise<AsyncGenerator<CLIStreamEvent>>;
-export function enqueueRequest(
-  request: CLIRequest,
-  streaming: boolean,
-): Promise<CLIResult | AsyncGenerator<CLIStreamEvent>> {
+  _streaming: boolean,
+): Promise<CLIResult> {
   return new Promise((resolve, reject) => {
-    queue.push({ request, streaming, resolve, reject });
+    queue.push({ request, streaming: false, resolve, reject });
     log("info", "Queue", {
       queued: queue.length,
-      active: activeWorkers,
-      max: poolConfig.maxWorkers,
+      active: activeRequests,
+      warmPool: warmPool.length,
+      method: request.hasTools ? "cli" : "sdk",
     });
     tryProcessQueue();
   });
 }
 
-// ─── Non-Streaming CLI Execution ────────────────────────────────────────────
+// ─── SDK Execution (simple requests, pre-warmed, fast) ──────────────────────
+
+async function runSDK(request: CLIRequest): Promise<CLIResult> {
+  const warmWorker = warmPool.shift();
+  // Refill in background
+  fillPool().catch(() => {});
+
+  let text = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stopReason = "end_turn";
+
+  const source = warmWorker
+    ? warmWorker.query(request.prompt)
+    : query({
+        prompt: request.prompt,
+        options: {
+          model: request.model,
+          maxTurns: 1,
+          tools: [],
+          permissionMode: "bypassPermissions" as "default",
+          allowDangerouslySkipPermissions: true,
+        },
+      });
+
+  for await (const msg of source) {
+    if (msg.type === "assistant" && msg.message?.content) {
+      for (const block of msg.message.content) {
+        if (
+          typeof block === "object" &&
+          "type" in block &&
+          block.type === "text" &&
+          "text" in block
+        ) {
+          text += (block as { text: string }).text;
+        }
+      }
+    }
+    if (msg.type === "result" && msg.subtype === "success") {
+      text = msg.result ?? text;
+      inputTokens = msg.usage?.input_tokens ?? 0;
+      outputTokens = msg.usage?.output_tokens ?? 0;
+      stopReason = msg.stop_reason ?? "end_turn";
+    }
+    if (msg.type === "result" && msg.subtype !== "success") {
+      throw new Error(`SDK error: ${JSON.stringify(msg).slice(0, 300)}`);
+    }
+  }
+
+  return { text, inputTokens, outputTokens, stopReason };
+}
+
+// ─── CLI Execution (tool-calling requests, supports --system-prompt) ────────
 
 async function runCLI(request: CLIRequest): Promise<CLIResult> {
-  const args = buildArgs(request, "json");
+  const args = [
+    "--print",
+    "--output-format",
+    "json",
+    "--model",
+    request.model,
+    "--no-session-persistence",
+    "--max-turns",
+    "1",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    '{"mcpServers":{}}',
+  ];
+
+  if (request.systemPrompt) {
+    args.push("--system-prompt", request.systemPrompt);
+  }
 
   return new Promise((resolve, reject) => {
-    const proc = spawnCLI(args, request.prompt);
+    const proc = spawn("claude", args, {
+      env: { ...process.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    proc.stdin?.write(request.prompt);
+    proc.stdin?.end();
+
     let stdout = "";
     let stderr = "";
 
@@ -118,24 +228,24 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
         );
       }
       try {
-        // Sanitize raw control characters (CLI emits literal \n inside JSON strings)
         const sanitized = stdout.replace(
           /[\x00-\x1f\x7f]/g,
-          (ch) => ch === "\n" || ch === "\r" || ch === "\t" ? ch : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+          (ch) =>
+            ch === "\n" || ch === "\r" || ch === "\t"
+              ? ch
+              : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
         );
         const parsed = JSON.parse(sanitized);
         resolve({
           text: parsed.result ?? "",
-          toolCalls: [],
           inputTokens: parsed.input_tokens ?? parsed.usage?.input_tokens ?? 0,
-          outputTokens: parsed.output_tokens ?? parsed.usage?.output_tokens ?? 0,
+          outputTokens:
+            parsed.output_tokens ?? parsed.usage?.output_tokens ?? 0,
           stopReason: parsed.stop_reason ?? "end_turn",
         });
       } catch {
-        // JSON mode failed, use text
         resolve({
           text: stdout.trim(),
-          toolCalls: [],
           inputTokens: 0,
           outputTokens: 0,
           stopReason: "end_turn",
@@ -148,185 +258,6 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
       reject(err);
     });
   });
-}
-
-// ─── Streaming CLI Execution ────────────────────────────────────────────────
-
-async function runCLIStream(
-  request: CLIRequest,
-): Promise<AsyncGenerator<CLIStreamEvent>> {
-  const args = buildArgs(request, "stream-json");
-  const proc = spawnCLI(args, request.prompt);
-
-  async function* generate(): AsyncGenerator<CLIStreamEvent> {
-    let buffer = "";
-    let lastUsage = { inputTokens: 0, outputTokens: 0 };
-
-    const timer = setTimeout(() => {
-      proc.kill("SIGKILL");
-    }, poolConfig.timeoutMs);
-
-    try {
-      for await (const chunk of proc.stdout as AsyncIterable<Buffer>) {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const event = parseStreamLine(line);
-          if (event) {
-            if (event.usage) lastUsage = event.usage;
-            yield event;
-          }
-        }
-      }
-
-      // Process remaining buffer
-      if (buffer.trim()) {
-        const event = parseStreamLine(buffer);
-        if (event) yield event;
-      }
-
-      yield {
-        type: "stop",
-        stopReason: "end_turn",
-        usage: lastUsage,
-      };
-    } finally {
-      clearTimeout(timer);
-      if (!proc.killed) proc.kill();
-    }
-  }
-
-  return generate();
-}
-
-function parseStreamLine(line: string): CLIStreamEvent | null {
-  try {
-    const data = JSON.parse(line);
-
-    // Claude CLI stream-json emits assistant messages with full content
-    if (data.type === "assistant" && data.message?.content) {
-      const content = data.message.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block.type === "text" && block.text) {
-            return { type: "text", text: block.text };
-          }
-        }
-      }
-      return null;
-    }
-
-    if (data.type === "content_block_delta") {
-      const delta = data.delta;
-      if (delta?.type === "text_delta") {
-        return { type: "text", text: delta.text };
-      }
-      if (delta?.type === "input_json_delta") {
-        return {
-          type: "tool_call_delta",
-          toolCallIndex: data.index ?? 0,
-          text: delta.partial_json,
-        };
-      }
-    }
-
-    if (data.type === "content_block_start") {
-      const block = data.content_block;
-      if (block?.type === "tool_use") {
-        return {
-          type: "tool_call_start",
-          toolCall: {
-            id: block.id,
-            name: block.name,
-            arguments: "",
-          },
-          toolCallIndex: data.index ?? 0,
-        };
-      }
-    }
-
-    if (data.type === "message_delta") {
-      return {
-        type: "stop",
-        stopReason: data.delta?.stop_reason ?? "end_turn",
-        usage: {
-          inputTokens: data.usage?.input_tokens ?? 0,
-          outputTokens: data.usage?.output_tokens ?? 0,
-        },
-      };
-    }
-
-    // content_delta events from --include-partial-messages
-    if (data.type === "content_delta") {
-      const text = data.event?.delta?.text;
-      if (text) return { type: "text", text };
-    }
-
-    // result event (final)
-    if (data.type === "result") {
-      return {
-        type: "stop",
-        stopReason: data.stop_reason ?? "end_turn",
-        usage: {
-          inputTokens: data.input_tokens ?? 0,
-          outputTokens: data.output_tokens ?? 0,
-        },
-      };
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-// ─── CLI Process Spawning ───────────────────────────────────────────────────
-
-function buildArgs(
-  request: CLIRequest,
-  outputFormat: "json" | "stream-json",
-): string[] {
-  const args = [
-    "--print",
-    "--output-format",
-    outputFormat,
-    "--model",
-    request.model,
-    "--no-session-persistence",
-    "--max-turns",
-    "1",
-    "--tools",
-    "",
-    // Disable all MCP servers so they don't interfere with our tool definitions
-    "--strict-mcp-config",
-    '{"mcpServers":{}}',
-  ];
-
-  if (outputFormat === "stream-json") {
-    args.push("--verbose");
-  }
-
-  if (request.systemPrompt) {
-    args.push("--system-prompt", request.systemPrompt);
-  }
-
-  return args;
-}
-
-function spawnCLI(args: string[], prompt: string): ChildProcess {
-  // Pass prompt via stdin to avoid OS arg length limits
-  const proc = spawn("claude", args, {
-    env: { ...process.env },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  proc.stdin?.write(prompt);
-  proc.stdin?.end();
-
-  return proc;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

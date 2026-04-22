@@ -22,19 +22,36 @@ export interface CLIResult {
 
 export interface WorkerPoolConfig {
   timeoutMs: number;
+  maxConcurrent: number;
+  maxSessions: number;
 }
 
-let poolConfig: WorkerPoolConfig = { timeoutMs: 300_000 };
+let poolConfig: WorkerPoolConfig = {
+  timeoutMs: 300_000,
+  maxConcurrent: 8,
+  maxSessions: 200,
+};
 
 export function configurePool(config: WorkerPoolConfig): void {
   poolConfig = config;
 }
 
 // ─── Session Management ─────────────────────────────────────────────────────
-// Maps OpenClaw session keys to CLI session UUIDs.
-// First request creates a new session, subsequent requests resume it.
+// Maps OpenClaw session keys to CLI session UUIDs. LRU-evicted by insertion
+// order: touching a key re-inserts it so the Map's iteration order becomes
+// least-recently-used first.
 
 const sessions = new Map<string, string>();
+
+function touchSession(sessionKey: string, sessionId: string): void {
+  sessions.delete(sessionKey);
+  sessions.set(sessionKey, sessionId);
+  while (sessions.size > poolConfig.maxSessions) {
+    const oldest = sessions.keys().next().value;
+    if (oldest === undefined) break;
+    sessions.delete(oldest);
+  }
+}
 
 function getOrCreateSessionId(sessionKey: string | undefined): {
   sessionId: string;
@@ -45,24 +62,42 @@ function getOrCreateSessionId(sessionKey: string | undefined): {
   }
   const existing = sessions.get(sessionKey);
   if (existing) {
+    touchSession(sessionKey, existing);
     return { sessionId: existing, isNew: false };
   }
   const sessionId = randomUUID();
-  sessions.set(sessionKey, sessionId);
+  touchSession(sessionKey, sessionId);
   return { sessionId, isNew: true };
+}
+
+// ─── Concurrency Limiter ────────────────────────────────────────────────────
+
+let inFlight = 0;
+const waiters: Array<() => void> = [];
+
+async function acquireSlot(): Promise<void> {
+  while (inFlight >= poolConfig.maxConcurrent) {
+    await new Promise<void>((resolve) => waiters.push(resolve));
+  }
+  inFlight++;
+}
+
+function releaseSlot(): void {
+  inFlight--;
+  const next = waiters.shift();
+  if (next) next();
 }
 
 // ─── Request Execution ──────────────────────────────────────────────────────
 
-let activeRequests = 0;
-
-export function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
-  activeRequests++;
-  log("info", "Queue", { active: activeRequests });
-
-  return runCLI(request).finally(() => {
-    activeRequests--;
-  });
+export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
+  await acquireSlot();
+  log("info", "Queue", { active: inFlight, waiting: waiters.length });
+  try {
+    return await runCLI(request);
+  } finally {
+    releaseSlot();
+  }
 }
 
 function runCLI(request: CLIRequest): Promise<CLIResult> {

@@ -4,9 +4,15 @@ import {
   type ServerResponse,
 } from "node:http";
 import { listModels, resolveModel } from "./models.js";
-import { enqueueRequest } from "./cli-worker.js";
+import {
+  enqueueRequest,
+  type CLIResult,
+  type CLIToolCall,
+} from "./cli-worker.js";
 import type { OAIChatRequest } from "./translate.js";
-import { buildPrompt, parseToolCallsFromText } from "./translate.js";
+import { buildPrompt, toolsFromRequest } from "./translate.js";
+
+const BRIDGE_VERSION = "3.3.0";
 
 export interface ServerConfig {
   port: number;
@@ -71,7 +77,7 @@ async function handleRequest(
   const url = req.url ?? "/";
 
   if (url === "/health" || url === "/healthz") {
-    return sendJson(res, 200, { status: "ok", version: "3.2.0" });
+    return sendJson(res, 200, { status: "ok", version: BRIDGE_VERSION });
   }
 
   if (url === "/v1/models" && req.method === "GET") {
@@ -129,6 +135,7 @@ async function handleChatCompletions(
 
   const model = resolveModel(oaiReq.model ?? "claude-sonnet-4");
   const built = buildPrompt(oaiReq);
+  const tools = toolsFromRequest(oaiReq);
   const startTime = Date.now();
 
   log("info", "Request", {
@@ -136,14 +143,10 @@ async function handleChatCompletions(
     cliModel: model.cliAlias,
     stream: !!oaiReq.stream,
     messages: oaiReq.messages.length,
-    tools: oaiReq.tools?.length ?? 0,
+    tools: tools.length,
     hasSystemPrompt: !!built.systemPrompt,
   });
 
-  const hasTools = (oaiReq.tools?.length ?? 0) > 0;
-
-  // Extract just the last user message for resumed sessions.
-  // The CLI already has the conversation history from the session.
   const lastUserMsg = oaiReq.messages.filter((m) => m.role === "user").pop();
   const lastUserText = lastUserMsg
     ? (typeof lastUserMsg.content === "string"
@@ -161,59 +164,26 @@ async function handleChatCompletions(
     lastMessage: lastUserText,
     model: model.cliAlias,
     systemPrompt: built.systemPrompt,
-    hasTools,
+    tools,
     sessionKey: oaiReq.user,
   };
 
   try {
+    const result = await enqueueRequest(cliReq);
+    const duration = Date.now() - startTime;
+    log("info", "Response", {
+      model: model.id,
+      duration,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      toolCalls: result.toolCalls.length,
+      rateLimitStatus: result.rateLimitStatus,
+    });
+
     if (oaiReq.stream) {
-      // All streaming is buffered — SDK/CLI return complete responses
-      const result = await enqueueRequest(cliReq);
-      const parsed = parseToolCallsFromText(result.text);
-      await emitBufferedAsSSE(res, parsed, model.id, result, startTime);
+      await emitBufferedAsSSE(res, result, model.id, duration);
     } else {
-      const result = await enqueueRequest(cliReq);
-      const duration = Date.now() - startTime;
-      log("info", "Response", {
-        model: model.id,
-        duration,
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-      });
-
-      const parsed = parseToolCallsFromText(result.text);
-      const hasToolCalls = parsed.toolCalls.length > 0;
-
-      const message: Record<string, unknown> = {
-        role: "assistant",
-        content: parsed.text || null,
-      };
-      if (hasToolCalls) {
-        message.tool_calls = parsed.toolCalls.map((tc) => ({
-          id: tc.id,
-          type: "function",
-          function: { name: tc.name, arguments: tc.arguments },
-        }));
-      }
-
-      sendJson(res, 200, {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: model.id,
-        choices: [
-          {
-            index: 0,
-            message,
-            finish_reason: hasToolCalls ? "tool_calls" : "stop",
-          },
-        ],
-        usage: {
-          prompt_tokens: result.inputTokens,
-          completion_tokens: result.outputTokens,
-          total_tokens: result.inputTokens + result.outputTokens,
-        },
-      });
+      sendJson(res, 200, buildCompletionResponse(result, model.id));
     }
   } catch (err) {
     const duration = Date.now() - startTime;
@@ -229,14 +199,56 @@ async function handleChatCompletions(
   }
 }
 
-// ─── Buffered SSE (for tool-calling requests) ───────────────────────────────
+// ─── Response Formatting ────────────────────────────────────────────────────
+
+function buildCompletionResponse(
+  result: CLIResult,
+  modelId: string,
+): Record<string, unknown> {
+  const hasToolCalls = result.toolCalls.length > 0;
+  const message: Record<string, unknown> = {
+    role: "assistant",
+    content: result.text || null,
+  };
+  if (hasToolCalls) {
+    message.tool_calls = result.toolCalls.map(toOAIToolCall);
+  }
+  return {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: modelId,
+    choices: [
+      {
+        index: 0,
+        message,
+        finish_reason: hasToolCalls ? "tool_calls" : "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: result.inputTokens,
+      completion_tokens: result.outputTokens,
+      total_tokens: result.inputTokens + result.outputTokens,
+    },
+  };
+}
+
+function toOAIToolCall(tc: CLIToolCall): Record<string, unknown> {
+  return {
+    id: tc.id,
+    type: "function",
+    function: {
+      name: tc.name,
+      arguments: JSON.stringify(tc.input ?? {}),
+    },
+  };
+}
 
 async function emitBufferedAsSSE(
   res: ServerResponse,
-  parsed: import("./translate.js").ParsedResponse,
+  result: CLIResult,
   requestModel: string,
-  result: import("./cli-worker.js").CLIResult,
-  startTime: number,
+  duration: number,
 ): Promise<void> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -246,58 +258,82 @@ async function emitBufferedAsSSE(
 
   const msgId = `chatcmpl-${Date.now()}`;
   const ts = Math.floor(Date.now() / 1000);
-  const hasToolCalls = parsed.toolCalls.length > 0;
+  const hasToolCalls = result.toolCalls.length > 0;
 
-  // Role chunk
   writeSSE(res, {
-    id: msgId, object: "chat.completion.chunk", created: ts, model: requestModel,
-    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+    id: msgId,
+    object: "chat.completion.chunk",
+    created: ts,
+    model: requestModel,
+    choices: [
+      { index: 0, delta: { role: "assistant", content: "" }, finish_reason: null },
+    ],
   });
 
-  // Text content
-  if (parsed.text) {
+  if (result.text) {
     writeSSE(res, {
-      id: msgId, object: "chat.completion.chunk", created: ts, model: requestModel,
-      choices: [{ index: 0, delta: { content: parsed.text }, finish_reason: null }],
+      id: msgId,
+      object: "chat.completion.chunk",
+      created: ts,
+      model: requestModel,
+      choices: [
+        { index: 0, delta: { content: result.text }, finish_reason: null },
+      ],
     });
   }
 
-  // Tool calls
-  for (let i = 0; i < parsed.toolCalls.length; i++) {
-    const tc = parsed.toolCalls[i];
+  for (let i = 0; i < result.toolCalls.length; i++) {
+    const tc = result.toolCalls[i];
     writeSSE(res, {
-      id: msgId, object: "chat.completion.chunk", created: ts, model: requestModel,
-      choices: [{
-        index: 0,
-        delta: {
-          tool_calls: [{
-            index: i, id: tc.id, type: "function",
-            function: { name: tc.name, arguments: tc.arguments },
-          }],
+      id: msgId,
+      object: "chat.completion.chunk",
+      created: ts,
+      model: requestModel,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: i,
+                id: tc.id,
+                type: "function",
+                function: {
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.input ?? {}),
+                },
+              },
+            ],
+          },
+          finish_reason: null,
         },
-        finish_reason: null,
-      }],
+      ],
     });
   }
 
-  // Finish
   writeSSE(res, {
-    id: msgId, object: "chat.completion.chunk", created: ts, model: requestModel,
-    choices: [{ index: 0, delta: {}, finish_reason: hasToolCalls ? "tool_calls" : "stop" }],
+    id: msgId,
+    object: "chat.completion.chunk",
+    created: ts,
+    model: requestModel,
+    choices: [
+      {
+        index: 0,
+        delta: {},
+        finish_reason: hasToolCalls ? "tool_calls" : "stop",
+      },
+    ],
   });
 
   res.write("data: [DONE]\n\n");
   res.end();
 
   log("info", "Buffered stream complete", {
-    model: requestModel, duration: Date.now() - startTime,
-    toolCalls: parsed.toolCalls.length,
+    model: requestModel,
+    duration,
+    toolCalls: result.toolCalls.length,
   });
 }
-
-// ─── Old streaming handler removed — all responses are buffered now ─────────
-// SDK and CLI both return complete responses. Streaming to client is simulated
-// via emitBufferedAsSSE() which parses tool calls and emits SSE chunks.
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -330,5 +366,5 @@ function log(
 ): void {
   const entry = { ts: new Date().toISOString(), level, msg, ...extra };
   const out = level === "error" ? process.stderr : process.stdout;
-  out.write(JSON.stringify(entry) + "\n");
+  out.write(`${JSON.stringify(entry)}\n`);
 }

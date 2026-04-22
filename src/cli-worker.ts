@@ -1,21 +1,44 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { linesOf, parseStream, type StreamToolUse } from "./stream-parser.js";
+
+const MCP_SERVER_NAME = "openclaw";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MCP_SERVER_SCRIPT = path.resolve(__dirname, "./mcp-server.js");
+
+export interface ToolDefinition {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+}
 
 export interface CLIRequest {
-  prompt: string;       // Full conversation (for new sessions)
-  lastMessage: string;  // Just the latest user message (for resumed sessions)
+  prompt: string;
+  lastMessage: string;
   model: string;
   systemPrompt?: string;
-  hasTools: boolean;
-  sessionKey?: string;  // OpenClaw session identifier (from "user" field)
+  tools: ToolDefinition[];
+  sessionKey?: string;
+}
+
+export interface CLIToolCall {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
 }
 
 export interface CLIResult {
   text: string;
+  toolCalls: CLIToolCall[];
   inputTokens: number;
   outputTokens: number;
   stopReason: string;
   sessionId: string;
+  rateLimitStatus: string | undefined;
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -88,6 +111,52 @@ function releaseSlot(): void {
   if (next) next();
 }
 
+// ─── MCP Config ─────────────────────────────────────────────────────────────
+
+interface McpConfigFiles {
+  configPath: string;
+  cleanup: () => void;
+}
+
+function writeMcpConfig(tools: ToolDefinition[]): McpConfigFiles {
+  const id = randomUUID();
+  const toolsPath = path.join(os.tmpdir(), `bridge-tools-${id}.json`);
+  const configPath = path.join(os.tmpdir(), `bridge-mcp-${id}.json`);
+  fs.writeFileSync(toolsPath, JSON.stringify(tools));
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      mcpServers: {
+        [MCP_SERVER_NAME]: {
+          type: "stdio",
+          command: "node",
+          args: [MCP_SERVER_SCRIPT, toolsPath],
+        },
+      },
+    }),
+  );
+  return {
+    configPath,
+    cleanup: () => {
+      try {
+        fs.unlinkSync(toolsPath);
+      } catch {}
+      try {
+        fs.unlinkSync(configPath);
+      } catch {}
+    },
+  };
+}
+
+const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
+
+function stripMcpPrefix(tu: StreamToolUse): CLIToolCall {
+  const name = tu.name.startsWith(MCP_PREFIX)
+    ? tu.name.slice(MCP_PREFIX.length)
+    : tu.name;
+  return { id: tu.id, name, input: tu.input };
+}
+
 // ─── Request Execution ──────────────────────────────────────────────────────
 
 export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
@@ -100,13 +169,15 @@ export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
   }
 }
 
-function runCLI(request: CLIRequest): Promise<CLIResult> {
+async function runCLI(request: CLIRequest): Promise<CLIResult> {
   const { sessionId, isNew } = getOrCreateSessionId(request.sessionKey);
+  const hasTools = request.tools.length > 0;
 
   const args = [
     "--print",
     "--output-format",
-    "json",
+    "stream-json",
+    "--verbose",
     "--model",
     request.model,
     "--max-turns",
@@ -114,102 +185,106 @@ function runCLI(request: CLIRequest): Promise<CLIResult> {
     "--tools",
     "",
     "--strict-mcp-config",
-    '{"mcpServers":{}}',
   ];
 
+  let mcpCleanup: (() => void) | undefined;
+  if (hasTools) {
+    const mcp = writeMcpConfig(request.tools);
+    args.push("--mcp-config", mcp.configPath);
+    mcpCleanup = mcp.cleanup;
+  } else {
+    args.push("--mcp-config", JSON.stringify({ mcpServers: {} }));
+  }
+
   if (isNew) {
-    // New session: pass session ID, system prompt, full context
     args.push("--session-id", sessionId);
     if (request.systemPrompt) {
       args.push("--system-prompt", request.systemPrompt);
     }
   } else {
-    // Resume existing session: only send the new message
     args.push("--resume", sessionId);
   }
 
-  // New sessions get the full prompt, resumed sessions only get the last message
   const promptToSend = isNew ? request.prompt : request.lastMessage;
 
   log("info", "CLI spawn", {
     sessionId: sessionId.slice(0, 8),
     isNew,
     model: request.model,
+    toolCount: request.tools.length,
     promptLen: promptToSend.length,
   });
 
-  return new Promise((resolve, reject) => {
-    const proc = spawn("claude", args, {
-      env: { ...process.env },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    proc.stdin?.write(promptToSend);
-    proc.stdin?.end();
-
-    let stdout = "";
-    let stderr = "";
-
-    const timer = setTimeout(() => {
-      proc.kill("SIGKILL");
-      // If session timed out, remove it so next request creates fresh
-      if (request.sessionKey) sessions.delete(request.sessionKey);
-      reject(new Error(`CLI timeout after ${poolConfig.timeoutMs}ms`));
-    }, poolConfig.timeoutMs);
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        // If CLI failed, remove session so next request starts fresh
-        if (request.sessionKey) sessions.delete(request.sessionKey);
-        return reject(
-          new Error(`CLI exited ${code}: ${stderr.slice(0, 500)}`),
-        );
-      }
-      try {
-        const sanitized = stdout.replace(
-          /[\x00-\x1f\x7f]/g,
-          (ch) =>
-            ch === "\n" || ch === "\r" || ch === "\t"
-              ? ch
-              : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
-        );
-        const parsed = JSON.parse(sanitized);
-        resolve({
-          text: parsed.result ?? "",
-          inputTokens: parsed.input_tokens ?? parsed.usage?.input_tokens ?? 0,
-          outputTokens:
-            parsed.output_tokens ?? parsed.usage?.output_tokens ?? 0,
-          stopReason: parsed.stop_reason ?? "end_turn",
-          sessionId,
-        });
-      } catch {
-        resolve({
-          text: stdout.trim(),
-          inputTokens: 0,
-          outputTokens: 0,
-          stopReason: "end_turn",
-          sessionId,
-        });
-      }
-    });
-
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      if (request.sessionKey) sessions.delete(request.sessionKey);
-      reject(err);
-    });
+  const proc = spawn("claude", args, {
+    env: { ...process.env },
+    stdio: ["pipe", "pipe", "pipe"],
   });
+
+  proc.stdin?.write(promptToSend);
+  proc.stdin?.end();
+
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGKILL");
+    if (request.sessionKey) sessions.delete(request.sessionKey);
+  }, poolConfig.timeoutMs);
+
+  try {
+    const [parsed, exitCode, stderrText] = await Promise.all([
+      parseStream(linesOf(proc.stdout!)),
+      new Promise<number | null>((resolve) =>
+        proc.on("close", (code) => resolve(code)),
+      ),
+      collectStream(proc.stderr!),
+    ]);
+
+    if (timedOut) {
+      throw new Error(`CLI timeout after ${poolConfig.timeoutMs}ms`);
+    }
+
+    const toolCalls = parsed.toolUses.map(stripMcpPrefix);
+    const stopReason =
+      toolCalls.length > 0 ? "tool_use" : parsed.stopReason;
+
+    if (parsed.isError && toolCalls.length === 0 && !parsed.text) {
+      const hint = parsed.errorMessage ?? `exit ${exitCode}`;
+      const stderrHint = stderrText.slice(0, 300);
+      if (request.sessionKey) sessions.delete(request.sessionKey);
+      throw new Error(`CLI error: ${hint}${stderrHint ? ` | stderr: ${stderrHint}` : ""}`);
+    }
+
+    if (exitCode !== 0 && toolCalls.length === 0 && !parsed.text) {
+      if (request.sessionKey) sessions.delete(request.sessionKey);
+      throw new Error(
+        `CLI exited ${exitCode}: ${stderrText.slice(0, 500)}`,
+      );
+    }
+
+    return {
+      text: parsed.text,
+      toolCalls,
+      inputTokens: parsed.inputTokens,
+      outputTokens: parsed.outputTokens,
+      stopReason,
+      sessionId,
+      rateLimitStatus: parsed.rateLimitStatus,
+    };
+  } finally {
+    clearTimeout(timer);
+    mcpCleanup?.();
+  }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+async function collectStream(
+  readable: NodeJS.ReadableStream,
+): Promise<string> {
+  let data = "";
+  for await (const chunk of readable) {
+    data += (chunk as Buffer).toString("utf-8");
+  }
+  return data;
+}
 
 function log(
   level: string,
@@ -217,5 +292,5 @@ function log(
   extra?: Record<string, unknown>,
 ): void {
   const entry = { ts: new Date().toISOString(), level, msg, ...extra };
-  process.stdout.write(JSON.stringify(entry) + "\n");
+  process.stdout.write(`${JSON.stringify(entry)}\n`);
 }

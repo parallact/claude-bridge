@@ -51,48 +51,29 @@ export interface BuiltPrompt {
   systemPrompt: string | undefined;
 }
 
+/**
+ * Assemble the text sent to Claude CLI.
+ *
+ * Tool definitions are no longer injected here — they are registered through
+ * an MCP stdio server so the model sees them as structured tools. Historical
+ * tool_calls and tool_result messages still need narration because Claude CLI
+ * stores its own session state and we don't rewrite that state; the narration
+ * keeps the model grounded when a session is resumed or a new session is
+ * primed with prior turns.
+ */
 export function buildPrompt(oai: OAIChatRequest): BuiltPrompt {
   const systemParts: string[] = [];
   const conversationParts: string[] = [];
 
-  // Extract system messages and tool definitions into systemPrompt
   for (const msg of oai.messages) {
     if (msg.role === "system") {
       systemParts.push(extractText(msg.content));
     }
   }
 
-  // Add tool definitions to system prompt (authoritative, not user text)
-  if (oai.tools?.length) {
-    const toolDefs = oai.tools
-      .map((t) => {
-        const fn = t.function;
-        return `- ${fn.name}: ${fn.description ?? ""}\n  Parameters: ${JSON.stringify(fn.parameters ?? {})}`;
-      })
-      .join("\n");
-    systemParts.push(
-      [
-        "<tools>",
-        "You have access to the following tools and MUST use them when appropriate.",
-        "To call a tool, output EXACTLY a <tool_call> XML tag with JSON inside.",
-        "Format: <tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>",
-        "",
-        "CRITICAL RULES:",
-        "- Output NOTHING after the closing </tool_call> tag. No explanation, no commentary. STOP immediately.",
-        "- If you need multiple tool calls, output each on its own line.",
-        "- Do NOT output <tool_result> tags — those come from the system, not from you.",
-        "",
-        toolDefs,
-        "</tools>",
-      ].join("\n"),
-    );
-  }
-
-  // Build conversation prompt (user, assistant, tool messages only)
   for (const msg of oai.messages) {
     switch (msg.role) {
       case "system":
-        // Already handled above
         break;
       case "user":
         conversationParts.push(extractText(msg.content));
@@ -109,9 +90,7 @@ export function buildPrompt(oai: OAIChatRequest): BuiltPrompt {
         }
         const combined = [text, ...toolParts].filter(Boolean).join("\n");
         if (combined) {
-          conversationParts.push(
-            `<previous_response>${combined}</previous_response>`,
-          );
+          conversationParts.push(`<previous_response>${combined}</previous_response>`);
         }
         break;
       }
@@ -140,51 +119,16 @@ export function extractText(content: OAIMessage["content"]): string {
   return String(content ?? "");
 }
 
-// ─── Tool Call Parsing (from CLI text response) ─────────────────────────────
-
-const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-
-export interface ParsedToolCall {
-  id: string;
-  name: string;
-  arguments: string;
-}
-
-export interface ParsedResponse {
-  text: string | null;
-  toolCalls: ParsedToolCall[];
-}
-
-let toolCallCounter = 0;
-
-export function parseToolCallsFromText(raw: string): ParsedResponse {
-  const toolCalls: ParsedToolCall[] = [];
-  let text = raw;
-
-  for (const match of raw.matchAll(TOOL_CALL_RE)) {
-    const json = match[1];
-    try {
-      const parsed = JSON.parse(json);
-      toolCalls.push({
-        id: `call_${Date.now()}_${toolCallCounter++}`,
-        name: parsed.name,
-        arguments:
-          typeof parsed.arguments === "string"
-            ? parsed.arguments
-            : JSON.stringify(parsed.arguments ?? {}),
-      });
-    } catch {
-      continue;
-    }
-    text = text.replace(match[0], "");
-  }
-
-  // If tool calls were found, discard ALL remaining text.
-  // The model sometimes adds commentary after tool calls — strip it.
-  if (toolCalls.length > 0) {
-    return { text: null, toolCalls };
-  }
-
-  text = text.trim();
-  return { text: text || null, toolCalls };
+export function toolsFromRequest(
+  oai: OAIChatRequest,
+): Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }> {
+  if (!oai.tools?.length) return [];
+  return oai.tools.map((t) => ({
+    name: t.function.name,
+    description: t.function.description,
+    inputSchema: (t.function.parameters as Record<string, unknown>) ?? {
+      type: "object",
+      properties: {},
+    },
+  }));
 }

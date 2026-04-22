@@ -16,8 +16,8 @@ const maxSessions = parseInt(
 configurePool({ timeoutMs, maxConcurrent, maxSessions });
 
 console.log("╔══════════════════════════════════════════╗");
-console.log("║        Claude Bridge v3.2.0              ║");
-console.log("║  OpenAI-compatible → Claude CLI          ║");
+console.log("║        Claude Bridge v3.3.0              ║");
+console.log("║  OpenAI ↔ Claude CLI + MCP tools         ║");
 console.log("╚══════════════════════════════════════════╝");
 console.log("");
 console.log(`  Timeout:        ${timeoutMs}ms`);

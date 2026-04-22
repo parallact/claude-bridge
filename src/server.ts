@@ -71,7 +71,7 @@ async function handleRequest(
   const url = req.url ?? "/";
 
   if (url === "/health" || url === "/healthz") {
-    return sendJson(res, 200, { status: "ok", version: "2.0.0" });
+    return sendJson(res, 200, { status: "ok", version: "3.2.0" });
   }
 
   if (url === "/v1/models" && req.method === "GET") {

@@ -6,13 +6,15 @@ import {
 import { listModels, resolveModel } from "./models.js";
 import {
   drainAndShutdown,
+  enqueuePersistent,
   enqueueRequest,
   getMetrics,
+  isPathDEnabled,
   type CLIResult,
   type CLIToolCall,
 } from "./cli-worker.js";
 import type { OAIChatRequest } from "./translate.js";
-import { buildPrompt, toolsFromRequest } from "./translate.js";
+import { buildPrompt, extractForPathD, toolsFromRequest } from "./translate.js";
 
 const BRIDGE_VERSION = "3.3.0";
 
@@ -214,10 +216,184 @@ async function handleChatCompletions(
     sessionKey: oaiReq.user,
   };
 
+  // Route to Path D (persistent CLI + in-bridge MCP) when:
+  //   - Feature flag is enabled
+  //   - Request carries a sessionKey (OpenAI `user` field)
+  //   - We can extract either a fresh user message OR a tool_result
+  //     (extractForPathD returns null when the shape isn't something we
+  //     handle yet, e.g. last message is assistant)
+  // Falls through to the v3.3 spawn-fresh path otherwise.
+  const pathD = isPathDEnabled() ? extractForPathD(oaiReq) : null;
+  if (pathD && oaiReq.user) {
+    const persistentReq = {
+      sessionKey: oaiReq.user,
+      model: model.cliAlias,
+      systemPrompt: pathD.systemPrompt,
+      tools,
+      lastUserText: pathD.lastUserText,
+      pendingToolResult: pathD.pendingToolResult,
+    };
+    if (oaiReq.stream) {
+      await handlePersistentStreaming(req, res, persistentReq, model.id, startTime);
+    } else {
+      await handlePersistentNonStreaming(res, persistentReq, model.id, startTime);
+    }
+    return;
+  }
+
   if (oaiReq.stream) {
     await handleStreaming(req, res, cliReq, model.id, startTime);
   } else {
     await handleNonStreaming(res, cliReq, model.id, startTime);
+  }
+}
+
+async function handlePersistentNonStreaming(
+  res: ServerResponse,
+  req: Parameters<typeof enqueuePersistent>[0],
+  modelId: string,
+  startTime: number,
+): Promise<void> {
+  try {
+    const result = await enqueuePersistent(req);
+    const duration = Date.now() - startTime;
+    log("info", "Response", {
+      model: modelId,
+      duration,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      toolCalls: result.toolCalls.length,
+      rateLimitStatus: result.rateLimitStatus,
+      pathD: true,
+      continuation: !!req.pendingToolResult,
+    });
+    sendJson(res, 200, buildCompletionResponse(result, modelId));
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", "Path D request failed", { model: modelId, duration, error: message });
+    if (!res.headersSent) {
+      const isTimeout = message.includes("timeout");
+      sendJson(res, isTimeout ? 504 : 500, {
+        error: { message, type: "api_error", code: null },
+      });
+    }
+  }
+}
+
+async function handlePersistentStreaming(
+  httpReq: IncomingMessage,
+  res: ServerResponse,
+  req: Parameters<typeof enqueuePersistent>[0],
+  modelId: string,
+  startTime: number,
+): Promise<void> {
+  const msgId = `chatcmpl-${Date.now()}`;
+  const ts = Math.floor(Date.now() / 1000);
+  let sseOpened = false;
+  let roleSent = false;
+
+  const openSSE = () => {
+    if (sseOpened) return;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    sseOpened = true;
+  };
+  const emitChunk = (delta: Record<string, unknown>, finish?: string) => {
+    writeSSE(res, {
+      id: msgId,
+      object: "chat.completion.chunk",
+      created: ts,
+      model: modelId,
+      choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    });
+  };
+
+  httpReq.on("close", () => {
+    if (!res.writableEnded) res.destroy();
+  });
+
+  let toolCallsEmitted = 0;
+  try {
+    const result = await enqueuePersistent(req, {
+      onTextDelta: (delta) => {
+        openSSE();
+        if (!roleSent) {
+          emitChunk({ role: "assistant", content: "" });
+          roleSent = true;
+        }
+        emitChunk({ content: delta });
+      },
+      onToolUse: (tu) => {
+        openSSE();
+        if (!roleSent) {
+          emitChunk({ role: "assistant", content: null });
+          roleSent = true;
+        }
+        emitChunk({
+          tool_calls: [
+            {
+              index: toolCallsEmitted,
+              id: tu.id,
+              type: "function",
+              function: {
+                name: tu.name.startsWith("mcp__openclaw__")
+                  ? tu.name.slice("mcp__openclaw__".length)
+                  : tu.name,
+                arguments: JSON.stringify(tu.input ?? {}),
+              },
+            },
+          ],
+        });
+        toolCallsEmitted++;
+      },
+    });
+
+    const duration = Date.now() - startTime;
+    log("info", "Response", {
+      model: modelId,
+      duration,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      toolCalls: result.toolCalls.length,
+      rateLimitStatus: result.rateLimitStatus,
+      pathD: true,
+      continuation: !!req.pendingToolResult,
+      streamed: true,
+    });
+
+    openSSE();
+    const hasToolCalls = result.toolCalls.length > 0;
+    emitChunk({}, hasToolCalls ? "tool_calls" : "stop");
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", "Path D stream failed", { model: modelId, error: message, streamed: sseOpened });
+    if (!sseOpened) {
+      const isTimeout = message.includes("timeout");
+      sendJson(res, isTimeout ? 504 : 500, {
+        error: { message, type: "api_error", code: null },
+      });
+      return;
+    }
+    try {
+      writeSSE(res, {
+        id: msgId,
+        object: "chat.completion.chunk",
+        created: ts,
+        model: modelId,
+        choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+        error: { message, type: "api_error" },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch {
+      res.destroy();
+    }
   }
 }
 

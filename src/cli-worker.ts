@@ -4,6 +4,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import type { BridgeMcpHttpServer, McpTool } from "./mcp-http.js";
+import type { PersistentSessionPool } from "./session-pool.js";
 import {
   linesOf,
   parseStream,
@@ -62,6 +65,145 @@ let poolConfig: WorkerPoolConfig = {
 
 export function configurePool(config: WorkerPoolConfig): void {
   poolConfig = config;
+}
+
+// ─── Path D wiring ──────────────────────────────────────────────────────────
+
+interface PathDConfig {
+  enabled: boolean;
+  mcpServer: BridgeMcpHttpServer;
+  sessionPool: PersistentSessionPool;
+}
+
+let pathDConfig: PathDConfig | null = null;
+
+export function configurePathD(config: PathDConfig): void {
+  pathDConfig = config;
+}
+
+export function isPathDEnabled(): boolean {
+  return !!(pathDConfig && pathDConfig.enabled);
+}
+
+/** Request shape for Path D. Distinct from CLIRequest because the persistent
+ *  path handles continuations (tool_result injection) differently. */
+export interface PersistentCLIRequest {
+  sessionKey: string; // required — Path D needs a stable key
+  model: string;
+  systemPrompt: string | undefined;
+  tools: McpTool[];
+  /** The latest user text (for initial turn) or empty string (for
+   *  continuation where the "input" comes via resolveToolCall). */
+  lastUserText: string;
+  /** If present, this is a continuation: deliver this tool_result via the
+   *  bridge MCP before reading the next checkpoint. */
+  pendingToolResult:
+    | { toolUseId: string; content: Array<Record<string, unknown>> | string }
+    | null;
+}
+
+function fingerprint(spec: {
+  model: string;
+  tools: McpTool[];
+  systemPrompt: string | undefined;
+}): string {
+  const hash = createHash("sha256");
+  hash.update(spec.model);
+  hash.update("\0");
+  hash.update(spec.systemPrompt ?? "");
+  hash.update("\0");
+  const sortedTools = [...spec.tools].sort((a, b) => a.name.localeCompare(b.name));
+  for (const t of sortedTools) {
+    hash.update(t.name);
+    hash.update("\0");
+    hash.update(JSON.stringify(t.inputSchema));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+/** Path D entry point. Either sends a fresh user message on a reused
+ *  session, or delivers a tool_result to a previously-captured tool_use
+ *  and continues reading events. Returns once the CLI emits tool_use
+ *  (partial turn — caller must execute the tool and retry) or `result`
+ *  (final turn). */
+export async function enqueuePersistent(
+  request: PersistentCLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
+  if (!pathDConfig || !pathDConfig.enabled) {
+    throw new Error("Path D is not enabled");
+  }
+  const { mcpServer, sessionPool } = pathDConfig;
+
+  // Per-session serialization is still required: two concurrent requests
+  // for the same sessionKey would race on the CLI's stream.
+  return serializeOnSession(request.sessionKey, async () => {
+    await acquireSlot();
+    log("info", "PathD queue", { active: inFlight, waiting: waiters.length });
+    metrics.totalRequests++;
+    const startedAt = Date.now();
+    try {
+      const spec_fp = fingerprint(request);
+      const session = sessionPool.acquire(request.sessionKey, {
+        model: request.model,
+        tools: request.tools,
+        systemPrompt: request.systemPrompt,
+        spec_fp,
+      });
+
+      if (request.pendingToolResult) {
+        // Continuation: resolve the parked MCP tools/call, then read events
+        // until the next significant checkpoint.
+        mcpServer.resolveToolCall(
+          request.sessionKey,
+          request.pendingToolResult.toolUseId,
+          request.pendingToolResult.content,
+        );
+      } else {
+        // Initial: feed the user message to stdin.
+        session.sendUserMessage(request.lastUserText);
+      }
+
+      const cp = await session.nextCheckpoint(handlers, poolConfig.timeoutMs);
+
+      const toolCalls: CLIToolCall[] = cp.toolUse
+        ? [
+            {
+              id: cp.toolUse.toolUseId,
+              name: cp.toolUse.name.startsWith("mcp__openclaw__")
+                ? cp.toolUse.name.slice("mcp__openclaw__".length)
+                : cp.toolUse.name,
+              input: cp.toolUse.args,
+            },
+          ]
+        : [];
+
+      const stopReason =
+        toolCalls.length > 0 ? "tool_use" : cp.result?.stopReason ?? "end_turn";
+      if (cp.result?.isError && toolCalls.length === 0 && !cp.text) {
+        throw new Error(`CLI error: ${cp.result.errorMessage ?? "unknown"}`);
+      }
+
+      metrics.successes++;
+      metrics.latencyMsSum += Date.now() - startedAt;
+      metrics.latencyMsCount++;
+      return {
+        text: cp.text,
+        toolCalls,
+        inputTokens: cp.result?.inputTokens ?? 0,
+        outputTokens: cp.result?.outputTokens ?? 0,
+        stopReason,
+        sessionId: session.sessionId,
+        rateLimitStatus: cp.result?.rateLimitStatus,
+      };
+    } catch (err) {
+      metrics.failures++;
+      throw err;
+    } finally {
+      releaseSlot();
+    }
+  });
 }
 
 // ─── Session Management ─────────────────────────────────────────────────────

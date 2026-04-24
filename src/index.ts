@@ -1,5 +1,11 @@
 import { startServer } from "./server.js";
-import { cleanupStaleTempFiles, configurePool } from "./cli-worker.js";
+import {
+  cleanupStaleTempFiles,
+  configurePathD,
+  configurePool,
+} from "./cli-worker.js";
+import { BridgeMcpHttpServer } from "./mcp-http.js";
+import { PersistentSessionPool } from "./session-pool.js";
 
 const port = parseInt(process.env.CLAUDE_BRIDGE_PORT ?? "3456", 10);
 const host = process.env.CLAUDE_BRIDGE_HOST ?? "127.0.0.1";
@@ -13,9 +19,31 @@ const maxSessions = parseInt(
   10,
 );
 
+// Path D (persistent CLI per session + in-process MCP) is feature-flagged
+// off by default until we have real-traffic data. Flip CLAUDE_BRIDGE_PATH_D=1
+// in the env to turn it on. The plumbing always starts (MCP server + session
+// pool), but cli-worker.ts only routes to them when the flag is enabled.
+const pathDEnabled = /^(1|true|yes|on)$/i.test(
+  process.env.CLAUDE_BRIDGE_PATH_D ?? "",
+);
+const pathDPort = parseInt(process.env.CLAUDE_BRIDGE_MCP_PORT ?? "0", 10);
+
 configurePool({ timeoutMs, maxConcurrent, maxSessions });
-// Sweep leftover tmp files from prior crashes (normal shutdown cleans per-request).
 cleanupStaleTempFiles();
+
+const mcpServer = new BridgeMcpHttpServer();
+const mcpPort = await mcpServer.start(pathDPort, "127.0.0.1");
+const sessionPool = new PersistentSessionPool({
+  mcpServer,
+  config: {
+    idleEvictMs: parseInt(process.env.CLAUDE_BRIDGE_IDLE_EVICT_MS ?? "600000", 10),
+    maxLifetimeMs: parseInt(process.env.CLAUDE_BRIDGE_MAX_LIFETIME_MS ?? "3600000", 10),
+    maxSessions: parseInt(process.env.CLAUDE_BRIDGE_MAX_PERSISTENT_SESSIONS ?? "32", 10),
+    nextCheckpointTimeoutMs: timeoutMs,
+  },
+});
+
+configurePathD({ enabled: pathDEnabled, mcpServer, sessionPool });
 
 console.log("╔══════════════════════════════════════════╗");
 console.log("║        Claude Bridge v3.3.0              ║");
@@ -27,6 +55,20 @@ console.log(`  Max concurrent: ${maxConcurrent}`);
 console.log(`  Max sessions:   ${maxSessions}`);
 console.log(`  Bind:           ${host}:${port}`);
 console.log(`  API:            http://${host}:${port}/v1/chat/completions`);
+console.log(`  Path D:         ${pathDEnabled ? "enabled" : "disabled"} (MCP on 127.0.0.1:${mcpPort})`);
 console.log("");
 
 startServer({ port, host });
+
+// Bridge shutdown path already drains CLIs — extend it to also stop the
+// MCP server + persistent pool on SIGTERM/SIGINT.
+async function shutdownExtras(): Promise<void> {
+  await sessionPool.shutdown();
+  await mcpServer.stop();
+}
+process.on("SIGTERM", () => {
+  void shutdownExtras();
+});
+process.on("SIGINT", () => {
+  void shutdownExtras();
+});

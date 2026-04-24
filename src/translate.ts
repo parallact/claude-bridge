@@ -132,3 +132,92 @@ export function toolsFromRequest(
     },
   }));
 }
+
+// ─── Path D extraction ──────────────────────────────────────────────────────
+
+export interface PathDExtracted {
+  systemPrompt: string | undefined;
+  /** Fresh user text to feed the persistent CLI. Empty string when the
+   *  request is a pure continuation (tool_result delivery). */
+  lastUserText: string;
+  /** When the caller is delivering a tool_result, this is the payload +
+   *  the tool_use id it resolves. */
+  pendingToolResult:
+    | { toolUseId: string; content: Array<Record<string, unknown>> | string }
+    | null;
+}
+
+/**
+ * Extract just the information Path D needs from an OpenAI request.
+ * Unlike buildPrompt, this is *incremental*: the persistent CLI already
+ * holds the prior conversation in memory, so we only care about the last
+ * message the caller sent (a fresh user message OR a tool_result).
+ *
+ * - Last role=tool (OAI-native) → continuation. `tool_call_id` is the id
+ *   of the tool_use block this result belongs to.
+ * - Last role=user with a tool_result content block (Anthropic-style
+ *   adapter) → continuation. Extract `tool_use_id` + `content`.
+ * - Last role=user with text content → initial. Pack the text.
+ *
+ * Returns null if the shape is something we don't handle (e.g. no
+ * messages). Caller should fall back to the v3.3 path.
+ */
+export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
+  if (!oai.messages?.length) return null;
+  const systemParts: string[] = [];
+  for (const msg of oai.messages) {
+    if (msg.role === "system") systemParts.push(extractText(msg.content));
+  }
+  const systemPrompt = systemParts.length > 0 ? systemParts.join("\n\n") : undefined;
+
+  const last = oai.messages[oai.messages.length - 1];
+  if (!last) return null;
+
+  if (last.role === "tool") {
+    const toolUseId = last.tool_call_id;
+    if (!toolUseId) return null;
+    return {
+      systemPrompt,
+      lastUserText: "",
+      pendingToolResult: {
+        toolUseId,
+        content: extractText(last.content),
+      },
+    };
+  }
+
+  if (last.role === "user") {
+    // Anthropic-style tool_result carried inside a user message. Only the
+    // first tool_result block in the message is honored — with --max-turns
+    // 1 semantics there should only be one anyway. OAIContentPart.type is
+    // only "text" | "image_url" in our public type; callers using the
+    // Anthropic adapter add "tool_result" at runtime, so cast-via-unknown.
+    if (Array.isArray(last.content)) {
+      const parts = last.content as unknown as Array<Record<string, unknown>>;
+      for (const part of parts) {
+        if (part.type === "tool_result" && typeof part.tool_use_id === "string") {
+          const content = part.content as
+            | Array<Record<string, unknown>>
+            | string
+            | undefined;
+          return {
+            systemPrompt,
+            lastUserText: "",
+            pendingToolResult: {
+              toolUseId: part.tool_use_id,
+              content: content ?? "",
+            },
+          };
+        }
+      }
+    }
+    return {
+      systemPrompt,
+      lastUserText: extractText(last.content),
+      pendingToolResult: null,
+    };
+  }
+
+  // Last message is assistant or system — doesn't match either pattern.
+  return null;
+}

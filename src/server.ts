@@ -214,33 +214,180 @@ async function handleChatCompletions(
     sessionKey: oaiReq.user,
   };
 
+  if (oaiReq.stream) {
+    await handleStreaming(req, res, cliReq, model.id, startTime);
+  } else {
+    await handleNonStreaming(res, cliReq, model.id, startTime);
+  }
+}
+
+async function handleNonStreaming(
+  res: ServerResponse,
+  cliReq: Parameters<typeof enqueueRequest>[0],
+  modelId: string,
+  startTime: number,
+): Promise<void> {
   try {
     const result = await enqueueRequest(cliReq);
     const duration = Date.now() - startTime;
     log("info", "Response", {
-      model: model.id,
+      model: modelId,
       duration,
       inputTokens: result.inputTokens,
       outputTokens: result.outputTokens,
       toolCalls: result.toolCalls.length,
       rateLimitStatus: result.rateLimitStatus,
     });
-
-    if (oaiReq.stream) {
-      await emitBufferedAsSSE(res, result, model.id, duration);
-    } else {
-      sendJson(res, 200, buildCompletionResponse(result, model.id));
-    }
+    sendJson(res, 200, buildCompletionResponse(result, modelId));
   } catch (err) {
     const duration = Date.now() - startTime;
     const message = err instanceof Error ? err.message : String(err);
-    log("error", "Request failed", { model: model.id, duration, error: message });
-
+    log("error", "Request failed", { model: modelId, duration, error: message });
     if (!res.headersSent) {
       const isTimeout = message.includes("timeout");
       sendJson(res, isTimeout ? 504 : 500, {
         error: { message, type: "api_error", code: null },
       });
+    }
+  }
+}
+
+/**
+ * Real streaming: open the SSE response up front and write OAI-format
+ * chunks as deltas arrive from the CLI. Text goes out token-by-token;
+ * tool_use blocks arrive atomically from stream-json so we forward them
+ * as they land (not buffered to the end). Final `result` event triggers
+ * the finish chunk + [DONE].
+ *
+ * If the CLI fails BEFORE emitting anything, we can still send a clean
+ * JSON error response (headers not yet written). If it fails AFTER we've
+ * started streaming, the SSE stream is already committed — we emit a
+ * terminal error chunk and [DONE] so the client can tear down cleanly.
+ */
+async function handleStreaming(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cliReq: Parameters<typeof enqueueRequest>[0],
+  modelId: string,
+  startTime: number,
+): Promise<void> {
+  const msgId = `chatcmpl-${Date.now()}`;
+  const ts = Math.floor(Date.now() / 1000);
+  let sseOpened = false;
+  let roleSent = false;
+
+  const openSSE = () => {
+    if (sseOpened) return;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    sseOpened = true;
+  };
+
+  const emitChunk = (delta: Record<string, unknown>, finish?: string) => {
+    writeSSE(res, {
+      id: msgId,
+      object: "chat.completion.chunk",
+      created: ts,
+      model: modelId,
+      choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    });
+  };
+
+  // Client disconnect: don't keep writing to a dead socket (and don't let
+  // the CLI process drag on afterward — the timer in runCLI will eventually
+  // kill it, but killing now is cleaner). No-op if no proc attached yet.
+  req.on("close", () => {
+    if (!res.writableEnded) res.destroy();
+  });
+
+  let toolCallsEmitted = 0;
+  try {
+    const result = await enqueueRequest(cliReq, {
+      onTextDelta: (delta) => {
+        openSSE();
+        if (!roleSent) {
+          emitChunk({ role: "assistant", content: "" });
+          roleSent = true;
+        }
+        emitChunk({ content: delta });
+      },
+      onToolUse: (tu) => {
+        openSSE();
+        if (!roleSent) {
+          emitChunk({ role: "assistant", content: null });
+          roleSent = true;
+        }
+        emitChunk({
+          tool_calls: [
+            {
+              index: toolCallsEmitted,
+              id: tu.id,
+              type: "function",
+              function: {
+                name: tu.name.startsWith("mcp__openclaw__")
+                  ? tu.name.slice("mcp__openclaw__".length)
+                  : tu.name,
+                arguments: JSON.stringify(tu.input ?? {}),
+              },
+            },
+          ],
+        });
+        toolCallsEmitted++;
+      },
+    });
+
+    const duration = Date.now() - startTime;
+    log("info", "Response", {
+      model: modelId,
+      duration,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      toolCalls: result.toolCalls.length,
+      rateLimitStatus: result.rateLimitStatus,
+      streamed: true,
+    });
+
+    openSSE();
+    const hasToolCalls = result.toolCalls.length > 0;
+    emitChunk({}, hasToolCalls ? "tool_calls" : "stop");
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", "Request failed", {
+      model: modelId,
+      duration,
+      error: message,
+      streamed: sseOpened,
+    });
+
+    if (!sseOpened) {
+      // Nothing committed — emit a structured JSON error like non-streaming.
+      const isTimeout = message.includes("timeout");
+      sendJson(res, isTimeout ? 504 : 500, {
+        error: { message, type: "api_error", code: null },
+      });
+      return;
+    }
+    // SSE already opened: close cleanly with an error-flavored chunk so the
+    // client sees a terminal event instead of a hung connection.
+    try {
+      writeSSE(res, {
+        id: msgId,
+        object: "chat.completion.chunk",
+        created: ts,
+        model: modelId,
+        choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+        error: { message, type: "api_error" },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch {
+      res.destroy();
     }
   }
 }
@@ -288,97 +435,6 @@ function toOAIToolCall(tc: CLIToolCall): Record<string, unknown> {
       arguments: JSON.stringify(tc.input ?? {}),
     },
   };
-}
-
-async function emitBufferedAsSSE(
-  res: ServerResponse,
-  result: CLIResult,
-  requestModel: string,
-  duration: number,
-): Promise<void> {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  const msgId = `chatcmpl-${Date.now()}`;
-  const ts = Math.floor(Date.now() / 1000);
-  const hasToolCalls = result.toolCalls.length > 0;
-
-  writeSSE(res, {
-    id: msgId,
-    object: "chat.completion.chunk",
-    created: ts,
-    model: requestModel,
-    choices: [
-      { index: 0, delta: { role: "assistant", content: "" }, finish_reason: null },
-    ],
-  });
-
-  if (result.text) {
-    writeSSE(res, {
-      id: msgId,
-      object: "chat.completion.chunk",
-      created: ts,
-      model: requestModel,
-      choices: [
-        { index: 0, delta: { content: result.text }, finish_reason: null },
-      ],
-    });
-  }
-
-  for (let i = 0; i < result.toolCalls.length; i++) {
-    const tc = result.toolCalls[i];
-    writeSSE(res, {
-      id: msgId,
-      object: "chat.completion.chunk",
-      created: ts,
-      model: requestModel,
-      choices: [
-        {
-          index: 0,
-          delta: {
-            tool_calls: [
-              {
-                index: i,
-                id: tc.id,
-                type: "function",
-                function: {
-                  name: tc.name,
-                  arguments: JSON.stringify(tc.input ?? {}),
-                },
-              },
-            ],
-          },
-          finish_reason: null,
-        },
-      ],
-    });
-  }
-
-  writeSSE(res, {
-    id: msgId,
-    object: "chat.completion.chunk",
-    created: ts,
-    model: requestModel,
-    choices: [
-      {
-        index: 0,
-        delta: {},
-        finish_reason: hasToolCalls ? "tool_calls" : "stop",
-      },
-    ],
-  });
-
-  res.write("data: [DONE]\n\n");
-  res.end();
-
-  log("info", "Buffered stream complete", {
-    model: requestModel,
-    duration,
-    toolCalls: result.toolCalls.length,
-  });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

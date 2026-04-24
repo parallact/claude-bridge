@@ -63,8 +63,21 @@ export async function* linesOf(
   if (buffer.trim()) yield buffer;
 }
 
+/**
+ * Live event handlers. Fire as structured events are parsed, before the
+ * final StreamResult resolves. Use these to forward deltas to an SSE
+ * stream instead of waiting for the CLI to finish. Omit them for the
+ * classic "buffer everything" behavior used by non-streaming callers.
+ * Handlers should stay synchronous; they run inline on the parse loop.
+ */
+export interface StreamEventHandlers {
+  onTextDelta?: (delta: string) => void;
+  onToolUse?: (tu: StreamToolUse) => void;
+}
+
 export async function parseStream(
   lines: AsyncIterable<string>,
+  handlers?: StreamEventHandlers,
 ): Promise<StreamResult> {
   let text = "";
   const toolUses: StreamToolUse[] = [];
@@ -95,12 +108,15 @@ export async function parseStream(
       for (const block of content) {
         if (block.type === "text" && typeof block.text === "string") {
           text += block.text;
+          handlers?.onTextDelta?.(block.text);
         } else if (block.type === "tool_use" && block.id && block.name) {
-          toolUses.push({
+          const tu: StreamToolUse = {
             id: block.id,
             name: block.name,
             input: block.input ?? {},
-          });
+          };
+          toolUses.push(tu);
+          handlers?.onToolUse?.(tu);
         }
       }
       const usage = evt.message?.usage;

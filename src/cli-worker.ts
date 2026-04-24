@@ -4,7 +4,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { linesOf, parseStream, type StreamToolUse } from "./stream-parser.js";
+import {
+  linesOf,
+  parseStream,
+  type StreamEventHandlers,
+  type StreamToolUse,
+} from "./stream-parser.js";
 
 const MCP_SERVER_NAME = "openclaw";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -213,16 +218,39 @@ function isTransient(err: unknown): boolean {
   return TRANSIENT_PATTERNS.some((re) => re.test(msg));
 }
 
-async function runCLIWithRetry(request: CLIRequest): Promise<CLIResult> {
+async function runCLIWithRetry(
+  request: CLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
   const maxAttempts = 3;
   const backoffMs = [500, 1500]; // wait before attempt 2, 3
   let lastErr: unknown;
+  // If we've already streamed any bytes to the caller, a retry would emit a
+  // second leading assistant turn into the same SSE stream — confusing for
+  // the client and arguably worse than just failing. Track a "committed"
+  // flag: once any text/tool has hit the handler, retries are off.
+  let committed = false;
+  const trackedHandlers: StreamEventHandlers | undefined = handlers
+    ? {
+        onTextDelta: (d) => {
+          committed = true;
+          handlers.onTextDelta?.(d);
+        },
+        onToolUse: (t) => {
+          committed = true;
+          handlers.onToolUse?.(t);
+        },
+      }
+    : undefined;
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      return await runCLI(request);
+      return await runCLI(request, trackedHandlers);
     } catch (err) {
       lastErr = err;
-      if (attempt === maxAttempts || !isTransient(err)) throw err;
+      const canRetry =
+        attempt < maxAttempts && !committed && isTransient(err);
+      if (!canRetry) throw err;
       metrics.retries++;
       const wait = backoffMs[attempt - 1] ?? 1500;
       log("warn", "CLI transient error, retrying", {
@@ -236,7 +264,10 @@ async function runCLIWithRetry(request: CLIRequest): Promise<CLIResult> {
   throw lastErr; // unreachable, keeps TS happy
 }
 
-export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
+export async function enqueueRequest(
+  request: CLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
   // Per-session serialization first, then global concurrency. Order matters:
   // if two requests on session X arrive while a third on session Y runs, Y
   // goes parallel to the first X; the second X waits for the first X to
@@ -247,7 +278,7 @@ export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
     metrics.totalRequests++;
     const startedAt = Date.now();
     try {
-      const result = await runCLIWithRetry(request);
+      const result = await runCLIWithRetry(request, handlers);
       metrics.successes++;
       metrics.latencyMsSum += Date.now() - startedAt;
       metrics.latencyMsCount++;
@@ -261,7 +292,10 @@ export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
   });
 }
 
-async function runCLI(request: CLIRequest): Promise<CLIResult> {
+async function runCLI(
+  request: CLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
   const { sessionId, isNew } = getOrCreateSessionId(request.sessionKey);
   const hasTools = request.tools.length > 0;
 
@@ -326,7 +360,7 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
 
   try {
     const [parsed, exitCode, stderrText] = await Promise.all([
-      parseStream(linesOf(proc.stdout!)),
+      parseStream(linesOf(proc.stdout!), handlers),
       new Promise<number | null>((resolve) =>
         proc.on("close", (code) => resolve(code)),
       ),

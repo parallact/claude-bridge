@@ -7,6 +7,7 @@ import { listModels, resolveModel } from "./models.js";
 import {
   drainAndShutdown,
   enqueueRequest,
+  getMetrics,
   type CLIResult,
   type CLIToolCall,
 } from "./cli-worker.js";
@@ -106,6 +107,14 @@ async function handleRequest(
 
   if (url === "/health" || url === "/healthz") {
     return sendJson(res, 200, { status: "ok", version: BRIDGE_VERSION });
+  }
+
+  // Introspection for ops: current queue depth, lifetime counts, avg latency.
+  // Loopback-only exposure (bridge binds 127.0.0.1 by default) so leaking this
+  // isn't a concern, but the payload deliberately contains no request content
+  // — counts and numbers only.
+  if (url === "/metrics") {
+    return sendJson(res, 200, { version: BRIDGE_VERSION, ...getMetrics() });
   }
 
   if (url === "/v1/models" && req.method === "GET") {

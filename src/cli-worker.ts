@@ -223,6 +223,7 @@ async function runCLIWithRetry(request: CLIRequest): Promise<CLIResult> {
     } catch (err) {
       lastErr = err;
       if (attempt === maxAttempts || !isTransient(err)) throw err;
+      metrics.retries++;
       const wait = backoffMs[attempt - 1] ?? 1500;
       log("warn", "CLI transient error, retrying", {
         attempt,
@@ -243,8 +244,17 @@ export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
   return serializeOnSession(request.sessionKey, async () => {
     await acquireSlot();
     log("info", "Queue", { active: inFlight, waiting: waiters.length });
+    metrics.totalRequests++;
+    const startedAt = Date.now();
     try {
-      return await runCLIWithRetry(request);
+      const result = await runCLIWithRetry(request);
+      metrics.successes++;
+      metrics.latencyMsSum += Date.now() - startedAt;
+      metrics.latencyMsCount++;
+      return result;
+    } catch (err) {
+      metrics.failures++;
+      throw err;
     } finally {
       releaseSlot();
     }
@@ -368,6 +378,55 @@ async function collectStream(
     data += (chunk as Buffer).toString("utf-8");
   }
   return data;
+}
+
+// ─── Metrics ────────────────────────────────────────────────────────────────
+
+const metrics = {
+  totalRequests: 0,
+  successes: 0,
+  failures: 0,
+  retries: 0,
+  // Latency running sum + count (in ms). Simpler than a histogram and good
+  // enough for p50-ish reporting. If we ever care about tail latency we'd
+  // plug in a real HDR histogram.
+  latencyMsSum: 0,
+  latencyMsCount: 0,
+  // Start time so /metrics can report uptime.
+  startedAtMs: Date.now(),
+};
+
+export interface BridgeMetrics {
+  uptimeSec: number;
+  totalRequests: number;
+  successes: number;
+  failures: number;
+  retries: number;
+  avgLatencyMs: number | null;
+  inFlight: number;
+  waiting: number;
+  activeProcesses: number;
+  sessions: number;
+  sessionTails: number;
+}
+
+export function getMetrics(): BridgeMetrics {
+  return {
+    uptimeSec: Math.round((Date.now() - metrics.startedAtMs) / 1000),
+    totalRequests: metrics.totalRequests,
+    successes: metrics.successes,
+    failures: metrics.failures,
+    retries: metrics.retries,
+    avgLatencyMs:
+      metrics.latencyMsCount === 0
+        ? null
+        : Math.round(metrics.latencyMsSum / metrics.latencyMsCount),
+    inFlight,
+    waiting: waiters.length,
+    activeProcesses: activeProcs.size,
+    sessions: sessions.size,
+    sessionTails: sessionTail.size,
+  };
 }
 
 // ─── Shutdown / Cleanup ─────────────────────────────────────────────────────

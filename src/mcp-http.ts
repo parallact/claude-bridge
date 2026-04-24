@@ -145,6 +145,27 @@ export class BridgeMcpHttpServer {
     });
   }
 
+  /** Block briefly until the MCP POST for this tool_use_id lands in the
+   *  pending map. The stream-json event that the bridge reads from the CLI
+   *  can fire slightly before the MCP tools/call HTTP request arrives here,
+   *  so the bridge needs to wait for this gate before returning the
+   *  tool_use to the OAI caller — otherwise a fast caller round-trips with
+   *  a tool_result before pending exists and resolveToolCall throws. */
+  async waitForPending(sessionKey: string, toolUseId: string, timeoutMs = 10_000): Promise<void> {
+    const ctx = this.sessions.get(sessionKey);
+    if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
+    if (ctx.pending.has(toolUseId)) return;
+    const deadline = Date.now() + timeoutMs;
+    // Tight polling is fine here: the MCP POST usually lands within a few
+    // event-loop ticks, and the only alternative (wiring per-id events)
+    // bloats the pending-call data structure for a race that's ~ms wide.
+    while (Date.now() < deadline) {
+      if (ctx.pending.has(toolUseId)) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`waitForPending timeout: ${toolUseId} did not arrive within ${timeoutMs}ms`);
+  }
+
   /** Deliver a real tool_result to a previously-captured tool_use. Causes
    *  the parked HTTP response to flush, unblocking the CLI. */
   resolveToolCall(sessionKey: string, toolUseId: string, content: unknown): void {

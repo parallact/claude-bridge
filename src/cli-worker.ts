@@ -190,6 +190,51 @@ function stripMcpPrefix(tu: StreamToolUse): CLIToolCall {
 
 // ─── Request Execution ──────────────────────────────────────────────────────
 
+// ─── Transient-error retry ──────────────────────────────────────────────────
+
+// Conservative: only retry errors we can be confident come from transport
+// flakiness (CLI timeout, network reset, 5xx upstream). Logical errors
+// (wrong model name, invalid arg) must surface immediately so the caller
+// fixes the request instead of hammering the same bad input 3 times.
+const TRANSIENT_PATTERNS = [
+  /CLI timeout after/i,
+  /ECONNRESET/,
+  /ETIMEDOUT/,
+  /EAI_AGAIN/,
+  /socket hang up/i,
+  /network\s+error/i,
+  /\b5\d{2}\b/, // 500-599 upstream
+  /rate.?limit/i,
+  /overloaded/i,
+];
+
+function isTransient(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TRANSIENT_PATTERNS.some((re) => re.test(msg));
+}
+
+async function runCLIWithRetry(request: CLIRequest): Promise<CLIResult> {
+  const maxAttempts = 3;
+  const backoffMs = [500, 1500]; // wait before attempt 2, 3
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await runCLI(request);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxAttempts || !isTransient(err)) throw err;
+      const wait = backoffMs[attempt - 1] ?? 1500;
+      log("warn", "CLI transient error, retrying", {
+        attempt,
+        wait,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastErr; // unreachable, keeps TS happy
+}
+
 export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
   // Per-session serialization first, then global concurrency. Order matters:
   // if two requests on session X arrive while a third on session Y runs, Y
@@ -199,7 +244,7 @@ export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
     await acquireSlot();
     log("info", "Queue", { active: inFlight, waiting: waiters.length });
     try {
-      return await runCLI(request);
+      return await runCLIWithRetry(request);
     } finally {
       releaseSlot();
     }

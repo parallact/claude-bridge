@@ -102,6 +102,33 @@ const waiters: Array<() => void> = [];
 // Set (not a count) because we need actual process refs to kill on timeout.
 const activeProcs = new Set<ChildProcess>();
 
+// Per-session serialization. Two concurrent requests on the same sessionKey
+// would both spawn `claude --resume <id>` against the same on-disk session,
+// and whichever finishes last clobbers the other's work. Chain them instead:
+// each request on a session awaits the previous one before proceeding.
+// Keyed by sessionKey; the stored Promise resolves when the current holder
+// finishes (success or failure). We clean up when the tail matches so the
+// map doesn't grow forever.
+const sessionTail = new Map<string, Promise<unknown>>();
+
+function serializeOnSession<T>(
+  sessionKey: string | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!sessionKey) return fn();
+  const prior = sessionTail.get(sessionKey) ?? Promise.resolve();
+  const run = prior.then(
+    () => fn(),
+    () => fn(), // prior failure shouldn't block us
+  );
+  sessionTail.set(sessionKey, run);
+  const cleanup = () => {
+    if (sessionTail.get(sessionKey) === run) sessionTail.delete(sessionKey);
+  };
+  run.then(cleanup, cleanup);
+  return run;
+}
+
 async function acquireSlot(): Promise<void> {
   while (inFlight >= poolConfig.maxConcurrent) {
     await new Promise<void>((resolve) => waiters.push(resolve));
@@ -164,13 +191,19 @@ function stripMcpPrefix(tu: StreamToolUse): CLIToolCall {
 // ─── Request Execution ──────────────────────────────────────────────────────
 
 export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
-  await acquireSlot();
-  log("info", "Queue", { active: inFlight, waiting: waiters.length });
-  try {
-    return await runCLI(request);
-  } finally {
-    releaseSlot();
-  }
+  // Per-session serialization first, then global concurrency. Order matters:
+  // if two requests on session X arrive while a third on session Y runs, Y
+  // goes parallel to the first X; the second X waits for the first X to
+  // finish before consuming a concurrency slot.
+  return serializeOnSession(request.sessionKey, async () => {
+    await acquireSlot();
+    log("info", "Queue", { active: inFlight, waiting: waiters.length });
+    try {
+      return await runCLI(request);
+    } finally {
+      releaseSlot();
+    }
+  });
 }
 
 async function runCLI(request: CLIRequest): Promise<CLIResult> {

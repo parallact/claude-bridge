@@ -265,7 +265,6 @@ class PersistentSession {
     let outputTokens = 0;
     let inputTokens = 0;
     let rateLimitStatus: string | undefined;
-    let sawUserInjection = false;
     for await (const line of lines) {
       if (!line.trim()) continue;
       let evt: Record<string, unknown>;
@@ -280,7 +279,14 @@ class PersistentSession {
         rateLimitStatus = info?.status;
         continue;
       }
-      if (type === "assistant" && !sawUserInjection) {
+      // Note: unlike the v3.3 stream-parser, Path D does NOT gate assistant
+      // events on a "saw user injection" flag. In v3.3 the CLI emitted a
+      // synthetic user message containing "permission denied" and we ignored
+      // anything after it. In Path D the synthetic user message contains
+      // the *real* tool_result we delivered via MCP, and the model's
+      // subsequent assistant text + tool_use is exactly what we want to
+      // capture for the continuation HTTP response.
+      if (type === "assistant") {
         const message = evt.message as
           | { content?: Array<Record<string, unknown>>; usage?: { input_tokens?: number; output_tokens?: number } }
           | undefined;
@@ -310,10 +316,9 @@ class PersistentSession {
         continue;
       }
       if (type === "user") {
-        // CLI injected a synthetic user message (the tool_result coming back
-        // from MCP resolution). We absorbed it and the model will react in
-        // the next assistant event — no need to surface it.
-        sawUserInjection = true;
+        // The CLI echoes back the user message it just consumed (the real
+        // tool_result delivered via MCP). Path D doesn't need to surface
+        // that to the caller — they already know what they sent us.
         continue;
       }
       if (type === "result") {
@@ -332,8 +337,7 @@ class PersistentSession {
             errorMessage,
           },
         });
-        // Reset per-turn state for the next user message.
-        sawUserInjection = false;
+        // Reset per-turn token + rate-limit state for the next user message.
         outputTokens = 0;
         inputTokens = 0;
         rateLimitStatus = undefined;

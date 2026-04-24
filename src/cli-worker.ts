@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -97,6 +97,10 @@ function getOrCreateSessionId(sessionKey: string | undefined): {
 
 let inFlight = 0;
 const waiters: Array<() => void> = [];
+// Track every live `claude` child process so graceful shutdown can drain
+// in-flight work and kill whatever remains past the drain deadline. Using a
+// Set (not a count) because we need actual process refs to kill on timeout.
+const activeProcs = new Set<ChildProcess>();
 
 async function acquireSlot(): Promise<void> {
   while (inFlight >= poolConfig.maxConcurrent) {
@@ -219,6 +223,8 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
     env: { ...process.env },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  activeProcs.add(proc);
+  proc.once("close", () => activeProcs.delete(proc));
 
   proc.stdin?.write(promptToSend);
   proc.stdin?.end();
@@ -284,6 +290,56 @@ async function collectStream(
     data += (chunk as Buffer).toString("utf-8");
   }
   return data;
+}
+
+// ─── Shutdown / Cleanup ─────────────────────────────────────────────────────
+
+/**
+ * Drain in-flight CLI requests, then SIGKILL anything still running.
+ * Returns once all child processes have exited (or been killed).
+ */
+export async function drainAndShutdown(timeoutMs = 10_000): Promise<void> {
+  if (activeProcs.size === 0) return;
+  log("info", "Drain start", { active: activeProcs.size });
+  const deadline = Date.now() + timeoutMs;
+  while (activeProcs.size > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (activeProcs.size > 0) {
+    log("warn", "Drain timeout — killing remaining", { remaining: activeProcs.size });
+    for (const proc of activeProcs) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  } else {
+    log("info", "Drain complete");
+  }
+}
+
+/**
+ * Remove stale `bridge-*.json` and `bridge-mcp-*.json` files in os.tmpdir().
+ * Normal operation cleans these per-request via mcpCleanup; this handles the
+ * crash path where the process exited before cleanup ran.
+ */
+export function cleanupStaleTempFiles(): void {
+  try {
+    const tmp = os.tmpdir();
+    const entries = fs.readdirSync(tmp);
+    let removed = 0;
+    for (const name of entries) {
+      if (!name.startsWith("bridge-") || !name.endsWith(".json")) continue;
+      try {
+        fs.unlinkSync(path.join(tmp, name));
+        removed++;
+      } catch {}
+    }
+    if (removed > 0) log("info", "Startup tmp cleanup", { removed });
+  } catch (err) {
+    log("warn", "tmp cleanup failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function log(

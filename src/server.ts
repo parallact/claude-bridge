@@ -5,6 +5,7 @@ import {
 } from "node:http";
 import { listModels, resolveModel } from "./models.js";
 import {
+  drainAndShutdown,
   enqueueRequest,
   type CLIResult,
   type CLIToolCall,
@@ -13,6 +14,10 @@ import type { OAIChatRequest } from "./translate.js";
 import { buildPrompt, toolsFromRequest } from "./translate.js";
 
 const BRIDGE_VERSION = "3.3.0";
+
+// Flipped to true on SIGTERM/SIGINT so new chat-completion requests get
+// rejected with 503 while we drain. Health + models stay up for LB checks.
+let isShuttingDown = false;
 
 export interface ServerConfig {
   port: number;
@@ -41,13 +46,36 @@ export function startServer(config: ServerConfig): void {
     }
   });
 
-  const shutdown = () => {
-    log("info", "Shutting down...");
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(1), 5000);
+  // Graceful shutdown:
+  //   1. Stop accepting new /v1/chat/completions (503)
+  //   2. Close the HTTP server so Node's keep-alive connections drain
+  //   3. drainAndShutdown() waits up to 10s for in-flight CLI to finish,
+  //      then SIGKILLs stragglers
+  //   4. Hard-stop timer (15s total) as last-resort safety net
+  let shuttingDownPromise: Promise<void> | null = null;
+  const shutdown = (signal: string) => {
+    if (shuttingDownPromise) return shuttingDownPromise;
+    log("info", "Shutting down", { signal });
+    isShuttingDown = true;
+    const hardStop = setTimeout(() => {
+      log("error", "Hard-stop timer fired — forcing exit");
+      process.exit(1);
+    }, 15_000);
+    hardStop.unref();
+    shuttingDownPromise = new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    }).then(() => drainAndShutdown(10_000)).then(() => {
+      log("info", "Shutdown complete");
+      process.exit(0);
+    });
+    return shuttingDownPromise;
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
 
   server.listen(config.port, config.host, () => {
     log(
@@ -111,6 +139,15 @@ async function handleChatCompletions(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  if (isShuttingDown) {
+    return sendJson(res, 503, {
+      error: {
+        message: "Bridge is shutting down; retry on the next instance",
+        type: "server_shutting_down",
+        code: null,
+      },
+    });
+  }
   const body = await readBody(req);
   if (!body) {
     return sendJson(res, 400, {

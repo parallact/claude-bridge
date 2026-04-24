@@ -167,6 +167,16 @@ export async function enqueuePersistent(
 
       const cp = await session.nextCheckpoint(handlers, poolConfig.timeoutMs);
 
+      // If the stream gave us a tool_use, block briefly until the MCP
+      // HTTP POST for it lands in the bridge's pending map. The two
+      // signals (stream-json event vs MCP POST) are independent channels
+      // and the stream usually wins by a few ms; without this gate, a
+      // fast caller round-trips with a tool_result before pending exists
+      // and resolveToolCall throws "no pending tool call".
+      if (cp.toolUse) {
+        await mcpServer.waitForPending(request.sessionKey, cp.toolUse.toolUseId);
+      }
+
       const toolCalls: CLIToolCall[] = cp.toolUse
         ? [
             {

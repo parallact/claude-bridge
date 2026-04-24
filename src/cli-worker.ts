@@ -1,10 +1,15 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { linesOf, parseStream, type StreamToolUse } from "./stream-parser.js";
+import {
+  linesOf,
+  parseStream,
+  type StreamEventHandlers,
+  type StreamToolUse,
+} from "./stream-parser.js";
 
 const MCP_SERVER_NAME = "openclaw";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -97,6 +102,37 @@ function getOrCreateSessionId(sessionKey: string | undefined): {
 
 let inFlight = 0;
 const waiters: Array<() => void> = [];
+// Track every live `claude` child process so graceful shutdown can drain
+// in-flight work and kill whatever remains past the drain deadline. Using a
+// Set (not a count) because we need actual process refs to kill on timeout.
+const activeProcs = new Set<ChildProcess>();
+
+// Per-session serialization. Two concurrent requests on the same sessionKey
+// would both spawn `claude --resume <id>` against the same on-disk session,
+// and whichever finishes last clobbers the other's work. Chain them instead:
+// each request on a session awaits the previous one before proceeding.
+// Keyed by sessionKey; the stored Promise resolves when the current holder
+// finishes (success or failure). We clean up when the tail matches so the
+// map doesn't grow forever.
+const sessionTail = new Map<string, Promise<unknown>>();
+
+function serializeOnSession<T>(
+  sessionKey: string | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!sessionKey) return fn();
+  const prior = sessionTail.get(sessionKey) ?? Promise.resolve();
+  const run = prior.then(
+    () => fn(),
+    () => fn(), // prior failure shouldn't block us
+  );
+  sessionTail.set(sessionKey, run);
+  const cleanup = () => {
+    if (sessionTail.get(sessionKey) === run) sessionTail.delete(sessionKey);
+  };
+  run.then(cleanup, cleanup);
+  return run;
+}
 
 async function acquireSlot(): Promise<void> {
   while (inFlight >= poolConfig.maxConcurrent) {
@@ -159,17 +195,107 @@ function stripMcpPrefix(tu: StreamToolUse): CLIToolCall {
 
 // ─── Request Execution ──────────────────────────────────────────────────────
 
-export async function enqueueRequest(request: CLIRequest): Promise<CLIResult> {
-  await acquireSlot();
-  log("info", "Queue", { active: inFlight, waiting: waiters.length });
-  try {
-    return await runCLI(request);
-  } finally {
-    releaseSlot();
-  }
+// ─── Transient-error retry ──────────────────────────────────────────────────
+
+// Conservative: only retry errors we can be confident come from transport
+// flakiness (CLI timeout, network reset, 5xx upstream). Logical errors
+// (wrong model name, invalid arg) must surface immediately so the caller
+// fixes the request instead of hammering the same bad input 3 times.
+const TRANSIENT_PATTERNS = [
+  /CLI timeout after/i,
+  /ECONNRESET/,
+  /ETIMEDOUT/,
+  /EAI_AGAIN/,
+  /socket hang up/i,
+  /network\s+error/i,
+  /\b5\d{2}\b/, // 500-599 upstream
+  /rate.?limit/i,
+  /overloaded/i,
+];
+
+function isTransient(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TRANSIENT_PATTERNS.some((re) => re.test(msg));
 }
 
-async function runCLI(request: CLIRequest): Promise<CLIResult> {
+async function runCLIWithRetry(
+  request: CLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
+  const maxAttempts = 3;
+  const backoffMs = [500, 1500]; // wait before attempt 2, 3
+  let lastErr: unknown;
+  // If we've already streamed any bytes to the caller, a retry would emit a
+  // second leading assistant turn into the same SSE stream — confusing for
+  // the client and arguably worse than just failing. Track a "committed"
+  // flag: once any text/tool has hit the handler, retries are off.
+  let committed = false;
+  const trackedHandlers: StreamEventHandlers | undefined = handlers
+    ? {
+        onTextDelta: (d) => {
+          committed = true;
+          handlers.onTextDelta?.(d);
+        },
+        onToolUse: (t) => {
+          committed = true;
+          handlers.onToolUse?.(t);
+        },
+      }
+    : undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await runCLI(request, trackedHandlers);
+    } catch (err) {
+      lastErr = err;
+      const canRetry =
+        attempt < maxAttempts && !committed && isTransient(err);
+      if (!canRetry) throw err;
+      metrics.retries++;
+      const wait = backoffMs[attempt - 1] ?? 1500;
+      log("warn", "CLI transient error, retrying", {
+        attempt,
+        wait,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastErr; // unreachable, keeps TS happy
+}
+
+export async function enqueueRequest(
+  request: CLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
+  // Per-session serialization first, then global concurrency. Order matters:
+  // if two requests on session X arrive while a third on session Y runs, Y
+  // goes parallel to the first X; the second X waits for the first X to
+  // finish before consuming a concurrency slot.
+  return serializeOnSession(request.sessionKey, async () => {
+    await acquireSlot();
+    log("info", "Queue", { active: inFlight, waiting: waiters.length });
+    metrics.totalRequests++;
+    const startedAt = Date.now();
+    try {
+      const result = await runCLIWithRetry(request, handlers);
+      metrics.successes++;
+      metrics.latencyMsSum += Date.now() - startedAt;
+      metrics.latencyMsCount++;
+      return result;
+    } catch (err) {
+      metrics.failures++;
+      throw err;
+    } finally {
+      releaseSlot();
+    }
+  });
+}
+
+async function runCLI(
+  request: CLIRequest,
+  handlers?: StreamEventHandlers,
+): Promise<CLIResult> {
   const { sessionId, isNew } = getOrCreateSessionId(request.sessionKey);
   const hasTools = request.tools.length > 0;
 
@@ -219,6 +345,8 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
     env: { ...process.env },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  activeProcs.add(proc);
+  proc.once("close", () => activeProcs.delete(proc));
 
   proc.stdin?.write(promptToSend);
   proc.stdin?.end();
@@ -232,7 +360,7 @@ async function runCLI(request: CLIRequest): Promise<CLIResult> {
 
   try {
     const [parsed, exitCode, stderrText] = await Promise.all([
-      parseStream(linesOf(proc.stdout!)),
+      parseStream(linesOf(proc.stdout!), handlers),
       new Promise<number | null>((resolve) =>
         proc.on("close", (code) => resolve(code)),
       ),
@@ -284,6 +412,105 @@ async function collectStream(
     data += (chunk as Buffer).toString("utf-8");
   }
   return data;
+}
+
+// ─── Metrics ────────────────────────────────────────────────────────────────
+
+const metrics = {
+  totalRequests: 0,
+  successes: 0,
+  failures: 0,
+  retries: 0,
+  // Latency running sum + count (in ms). Simpler than a histogram and good
+  // enough for p50-ish reporting. If we ever care about tail latency we'd
+  // plug in a real HDR histogram.
+  latencyMsSum: 0,
+  latencyMsCount: 0,
+  // Start time so /metrics can report uptime.
+  startedAtMs: Date.now(),
+};
+
+export interface BridgeMetrics {
+  uptimeSec: number;
+  totalRequests: number;
+  successes: number;
+  failures: number;
+  retries: number;
+  avgLatencyMs: number | null;
+  inFlight: number;
+  waiting: number;
+  activeProcesses: number;
+  sessions: number;
+  sessionTails: number;
+}
+
+export function getMetrics(): BridgeMetrics {
+  return {
+    uptimeSec: Math.round((Date.now() - metrics.startedAtMs) / 1000),
+    totalRequests: metrics.totalRequests,
+    successes: metrics.successes,
+    failures: metrics.failures,
+    retries: metrics.retries,
+    avgLatencyMs:
+      metrics.latencyMsCount === 0
+        ? null
+        : Math.round(metrics.latencyMsSum / metrics.latencyMsCount),
+    inFlight,
+    waiting: waiters.length,
+    activeProcesses: activeProcs.size,
+    sessions: sessions.size,
+    sessionTails: sessionTail.size,
+  };
+}
+
+// ─── Shutdown / Cleanup ─────────────────────────────────────────────────────
+
+/**
+ * Drain in-flight CLI requests, then SIGKILL anything still running.
+ * Returns once all child processes have exited (or been killed).
+ */
+export async function drainAndShutdown(timeoutMs = 10_000): Promise<void> {
+  if (activeProcs.size === 0) return;
+  log("info", "Drain start", { active: activeProcs.size });
+  const deadline = Date.now() + timeoutMs;
+  while (activeProcs.size > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (activeProcs.size > 0) {
+    log("warn", "Drain timeout — killing remaining", { remaining: activeProcs.size });
+    for (const proc of activeProcs) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  } else {
+    log("info", "Drain complete");
+  }
+}
+
+/**
+ * Remove stale `bridge-*.json` and `bridge-mcp-*.json` files in os.tmpdir().
+ * Normal operation cleans these per-request via mcpCleanup; this handles the
+ * crash path where the process exited before cleanup ran.
+ */
+export function cleanupStaleTempFiles(): void {
+  try {
+    const tmp = os.tmpdir();
+    const entries = fs.readdirSync(tmp);
+    let removed = 0;
+    for (const name of entries) {
+      if (!name.startsWith("bridge-") || !name.endsWith(".json")) continue;
+      try {
+        fs.unlinkSync(path.join(tmp, name));
+        removed++;
+      } catch {}
+    }
+    if (removed > 0) log("info", "Startup tmp cleanup", { removed });
+  } catch (err) {
+    log("warn", "tmp cleanup failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function log(

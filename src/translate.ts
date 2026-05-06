@@ -195,13 +195,13 @@ export function toolsFromRequest(
 
 export interface PathDExtracted {
   systemPrompt: string | undefined;
-  /** Fresh user text to feed the persistent CLI. Empty string when the
-   *  request is a pure continuation (tool_result delivery). */
-  lastUserText: string;
-  /** When the caller is delivering a tool_result, this is the payload +
-   *  the tool_use id it resolves. */
+  /** Last user message content as Anthropic content blocks. Empty array if
+   *  the request is a pure tool_result continuation. */
+  lastUserContent: ContentBlock[];
+  /** When the caller delivers a tool_result, this is the payload + the
+   *  tool_use id it resolves. Content is content-blocks (not flattened). */
   pendingToolResult:
-    | { toolUseId: string; content: Array<Record<string, unknown>> | string }
+    | { toolUseId: string; content: ContentBlock[] }
     | null;
 }
 
@@ -226,7 +226,8 @@ export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
   for (const msg of oai.messages) {
     if (msg.role === "system") systemParts.push(extractText(msg.content));
   }
-  const systemPrompt = systemParts.length > 0 ? systemParts.join("\n\n") : undefined;
+  const systemPrompt =
+    systemParts.length > 0 ? systemParts.join("\n\n") : undefined;
 
   const last = oai.messages[oai.messages.length - 1];
   if (!last) return null;
@@ -236,42 +237,44 @@ export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
     if (!toolUseId) return null;
     return {
       systemPrompt,
-      lastUserText: "",
+      lastUserContent: [],
       pendingToolResult: {
         toolUseId,
-        content: extractText(last.content),
+        content: toContentBlocks(last.content),
       },
     };
   }
 
   if (last.role === "user") {
-    // Anthropic-style tool_result carried inside a user message. Only the
-    // first tool_result block in the message is honored — with --max-turns
-    // 1 semantics there should only be one anyway. OAIContentPart.type is
-    // only "text" | "image_url" in our public type; callers using the
-    // Anthropic adapter add "tool_result" at runtime, so cast-via-unknown.
+    // Anthropic-style tool_result inside a user message. First match wins
+    // (with --max-turns there's only one anyway).
     if (Array.isArray(last.content)) {
       const parts = last.content as unknown as Array<Record<string, unknown>>;
       for (const part of parts) {
-        if (part.type === "tool_result" && typeof part.tool_use_id === "string") {
-          const content = part.content as
-            | Array<Record<string, unknown>>
-            | string
-            | undefined;
+        if (
+          part.type === "tool_result" &&
+          typeof part.tool_use_id === "string"
+        ) {
+          const rawContent = part.content;
+          let content: ContentBlock[];
+          if (typeof rawContent === "string") {
+            content = rawContent === "" ? [] : [{ type: "text", text: rawContent }];
+          } else if (Array.isArray(rawContent)) {
+            content = rawContent as ContentBlock[];
+          } else {
+            content = [];
+          }
           return {
             systemPrompt,
-            lastUserText: "",
-            pendingToolResult: {
-              toolUseId: part.tool_use_id,
-              content: content ?? "",
-            },
+            lastUserContent: [],
+            pendingToolResult: { toolUseId: part.tool_use_id, content },
           };
         }
       }
     }
     return {
       systemPrompt,
-      lastUserText: extractText(last.content),
+      lastUserContent: toContentBlocks(last.content),
       pendingToolResult: null,
     };
   }

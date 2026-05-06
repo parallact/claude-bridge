@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import type { BridgeMcpHttpServer, McpTool } from "./mcp-http.js";
 import type { PersistentSessionPool } from "./session-pool.js";
+import type { ContentBlock } from "./translate.js";
 import {
   linesOf,
   parseStream,
@@ -88,17 +89,17 @@ export function isPathDEnabled(): boolean {
 /** Request shape for Path D. Distinct from CLIRequest because the persistent
  *  path handles continuations (tool_result injection) differently. */
 export interface PersistentCLIRequest {
-  sessionKey: string; // required — Path D needs a stable key
+  sessionKey: string;
   model: string;
   systemPrompt: string | undefined;
   tools: McpTool[];
-  /** The latest user text (for initial turn) or empty string (for
-   *  continuation where the "input" comes via resolveToolCall). */
-  lastUserText: string;
-  /** If present, this is a continuation: deliver this tool_result via the
-   *  bridge MCP before reading the next checkpoint. */
+  /** Content blocks for the latest user message (text, images, etc).
+   *  Empty array when this is a pure continuation. */
+  lastUserContent: ContentBlock[];
+  /** If present, deliver this tool_result via the bridge MCP before reading
+   *  the next checkpoint. Content is content-blocks (preserves structure). */
   pendingToolResult:
-    | { toolUseId: string; content: Array<Record<string, unknown>> | string }
+    | { toolUseId: string; content: ContentBlock[] }
     | null;
 }
 
@@ -162,7 +163,7 @@ export async function enqueuePersistent(
         );
       } else {
         // Initial: feed the user message to stdin.
-        session.sendUserMessage(request.lastUserText);
+        session.sendUserMessage(request.lastUserContent);
       }
 
       const cp = await session.nextCheckpoint(handlers, poolConfig.timeoutMs);

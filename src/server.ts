@@ -230,7 +230,7 @@ async function handleChatCompletions(
       model: model.cliAlias,
       systemPrompt: pathD.systemPrompt,
       tools,
-      lastUserText: pathD.lastUserText,
+      lastUserContent: pathD.lastUserContent,
       pendingToolResult: pathD.pendingToolResult,
     };
     if (oaiReq.stream) {

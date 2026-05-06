@@ -82,3 +82,95 @@ test("toContentBlocks: image_url without url is dropped", () => {
   ]);
   assert.deepEqual(result, [{ type: "text", text: "hi" }]);
 });
+
+import { extractForPathD } from "./translate.ts";
+
+test("extractForPathD: last user text → lastUserContent has text block", () => {
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      { role: "system", content: "be helpful" },
+      { role: "user", content: "hola" },
+    ],
+  });
+  assert.ok(result, "extractForPathD returned null");
+  assert.equal(result.systemPrompt, "be helpful");
+  assert.deepEqual(result.lastUserContent, [{ type: "text", text: "hola" }]);
+  assert.equal(result.pendingToolResult, null);
+});
+
+test("extractForPathD: last user with image preserves image block", () => {
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,XYZ" },
+          },
+        ],
+      },
+    ],
+  });
+  assert.ok(result);
+  assert.equal(result.lastUserContent.length, 2);
+  assert.equal(result.lastUserContent[0].type, "text");
+  assert.equal(result.lastUserContent[1].type, "image");
+});
+
+test("extractForPathD: role=tool → pendingToolResult.content is content blocks", () => {
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      { role: "user", content: "do thing" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", content: "the result", tool_call_id: "call_1" },
+    ],
+  });
+  assert.ok(result);
+  assert.deepEqual(result.lastUserContent, []);
+  assert.deepEqual(result.pendingToolResult, {
+    toolUseId: "call_1",
+    content: [{ type: "text", text: "the result" }],
+  });
+});
+
+test("extractForPathD: anthropic-style tool_result in user message preserves structure", () => {
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      { role: "user", content: "x" },
+      {
+        role: "user",
+        content: [
+          {
+            // @ts-expect-error — adapter shape, not in OAIContentPart
+            type: "tool_result",
+            tool_use_id: "call_2",
+            content: [
+              { type: "text", text: "row 1" },
+              { type: "text", text: "row 2" },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+  assert.ok(result);
+  assert.deepEqual(result.pendingToolResult, {
+    toolUseId: "call_2",
+    content: [
+      { type: "text", text: "row 1" },
+      { type: "text", text: "row 2" },
+    ],
+  });
+});

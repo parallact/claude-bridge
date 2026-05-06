@@ -77,7 +77,7 @@ export function toContentBlocks(content: OAIMessage["content"]): ContentBlock[] 
   for (const part of content) {
     if (part.type === "text" && part.text != null) {
       blocks.push({ type: "text", text: part.text });
-    } else if (part.type === "image_url" && part.image_url) {
+    } else if (part.type === "image_url" && part.image_url?.url) {
       blocks.push(toImageBlock(part.image_url));
     }
     // unknown types: drop. Stage 1 only handles text + image.
@@ -86,8 +86,9 @@ export function toContentBlocks(content: OAIMessage["content"]): ContentBlock[] 
 }
 
 function toImageBlock(image: { url: string; detail?: string }): ContentBlock {
-  // Data URL: data:<media-type>;base64,<data>
-  const dataUrlMatch = image.url.match(/^data:([^;]+);base64,(.+)$/);
+  // Data URL: data:<media-type>[;<param>...];base64,<data>
+  // Handles RFC 2397 multi-param URLs such as data:image/png;charset=utf-8;base64,...
+  const dataUrlMatch = image.url.match(/^data:([^;,]+)(?:;[^;,=]+(?:=[^;,]*)?)*;base64,(.+)$/);
   if (dataUrlMatch) {
     return {
       type: "image",

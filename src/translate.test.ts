@@ -58,3 +58,27 @@ test("toContentBlocks: mixed text + image preserved in order", () => {
   assert.equal(result[0].type, "text");
   assert.equal(result[1].type, "image");
 });
+
+test("toContentBlocks: data-URL with charset param parses correctly", () => {
+  const result = toContentBlocks([
+    {
+      type: "image_url",
+      image_url: { url: "data:image/png;charset=utf-8;base64,XYZ=" },
+    },
+  ]);
+  assert.deepEqual(result, [
+    {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "XYZ=" },
+    },
+  ]);
+});
+
+test("toContentBlocks: image_url without url is dropped", () => {
+  const result = toContentBlocks([
+    // @ts-expect-error — runtime data without required url field
+    { type: "image_url", image_url: {} },
+    { type: "text", text: "hi" },
+  ]);
+  assert.deepEqual(result, [{ type: "text", text: "hi" }]);
+});

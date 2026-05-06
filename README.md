@@ -65,6 +65,38 @@ ANTHROPIC_API_KEY=sk-ant-oat01-... npm start
 | `CLAUDE_BRIDGE_HOST` | `0.0.0.0` | Bind address |
 | `CLAUDE_BRIDGE_TIMEOUT_MS` | `300000` | Request timeout (ms) |
 | `CLAUDE_BRIDGE_MODEL_MAP` | `{}` | JSON override for model mappings |
+| `CLAUDE_BRIDGE_DEBUG_PROMPT` | `0` | When `1`/`true`, log full request+response payloads to a JSONL file. **Off by default** — opt-in for debugging. |
+| `CLAUDE_BRIDGE_DEBUG_PROMPT_FILE` | `/tmp/claude-bridge-debug-YYYY-MM-DD.jsonl` | Override the default debug log path. |
+
+## Debugging
+
+### Capturing full request payloads
+
+When agents are misbehaving (hallucinating, ignoring instructions, calling tools wrong), enable the debug logger to capture exactly what the bridge sent to the underlying CLI:
+
+```bash
+CLAUDE_BRIDGE_DEBUG_PROMPT=1 npm start
+```
+
+Or via Docker Compose:
+
+```yaml
+claude-bridge:
+  environment:
+    CLAUDE_BRIDGE_DEBUG_PROMPT: "1"
+```
+
+Each request appends two JSON-lines records to `/tmp/claude-bridge-debug-YYYY-MM-DD.jsonl`:
+- A `phase: "request"` record with system prompt length, tool schemas (hashed), and the full user content / messages
+- A `phase: "response"` record with stop reason, tool calls emitted, and a 500-char preview of assistant text
+
+To find a specific conversation, search for the `sessionKey`:
+
+```bash
+grep '"sessionKey":"agent:sofia:..."' /tmp/claude-bridge-debug-*.jsonl | jq .
+```
+
+**Off by default**. The flag adds I/O on every request when on, so leave it disabled in normal operation. Logs may contain sensitive content from message bodies — handle accordingly.
 
 ## Available Models
 

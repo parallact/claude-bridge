@@ -6,6 +6,7 @@ import {
 } from "./cli-worker.js";
 import { BridgeMcpHttpServer } from "./mcp-http.js";
 import { PersistentSessionPool } from "./session-pool.js";
+import { configureDebugLogger } from "./debug-logger.js";
 
 const port = parseInt(process.env.CLAUDE_BRIDGE_PORT ?? "3456", 10);
 const host = process.env.CLAUDE_BRIDGE_HOST ?? "127.0.0.1";
@@ -28,7 +29,16 @@ const pathDEnabled = /^(1|true|yes|on)$/i.test(
 );
 const pathDPort = parseInt(process.env.CLAUDE_BRIDGE_MCP_PORT ?? "0", 10);
 
+const debugPromptEnabled = /^(1|true|yes|on)$/i.test(
+  process.env.CLAUDE_BRIDGE_DEBUG_PROMPT ?? "",
+);
+const debugPromptFile = process.env.CLAUDE_BRIDGE_DEBUG_PROMPT_FILE;
+
 configurePool({ timeoutMs, maxConcurrent, maxSessions });
+configureDebugLogger({
+  enabled: debugPromptEnabled,
+  filePath: debugPromptFile,
+});
 cleanupStaleTempFiles();
 
 const mcpServer = new BridgeMcpHttpServer();
@@ -56,6 +66,9 @@ console.log(`  Max sessions:   ${maxSessions}`);
 console.log(`  Bind:           ${host}:${port}`);
 console.log(`  API:            http://${host}:${port}/v1/chat/completions`);
 console.log(`  Path D:         ${pathDEnabled ? "enabled" : "disabled"} (MCP on 127.0.0.1:${mcpPort})`);
+console.log(
+  `  Debug log:      ${debugPromptEnabled ? `enabled (${debugPromptFile ?? `/tmp/claude-bridge-debug-${new Date().toISOString().slice(0, 10)}.jsonl`})` : "disabled"}`,
+);
 console.log("");
 
 startServer({ port, host });

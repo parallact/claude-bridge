@@ -44,6 +44,63 @@ export interface OAIChatRequest {
   user?: string;
 }
 
+// ─── Anthropic Content Blocks ───────────────────────────────────────────────
+
+export type ImageSource =
+  | { type: "base64"; media_type: string; data: string }
+  | { type: "url"; url: string };
+
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: ImageSource }
+  | {
+      type: "tool_result";
+      tool_use_id: string;
+      content: ContentBlock[] | string;
+      is_error?: boolean;
+    };
+
+/**
+ * Convert OpenAI-shape message content into Anthropic content blocks.
+ * Preserves images (both data-URL and http) and text. Unknown OAI part
+ * types are dropped silently — caller should validate upstream.
+ */
+export function toContentBlocks(content: OAIMessage["content"]): ContentBlock[] {
+  if (content == null) return [];
+  if (typeof content === "string") {
+    return content === "" ? [] : [{ type: "text", text: content }];
+  }
+  if (!Array.isArray(content)) {
+    return [{ type: "text", text: String(content) }];
+  }
+  const blocks: ContentBlock[] = [];
+  for (const part of content) {
+    if (part.type === "text" && part.text != null) {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image_url" && part.image_url) {
+      blocks.push(toImageBlock(part.image_url));
+    }
+    // unknown types: drop. Stage 1 only handles text + image.
+  }
+  return blocks;
+}
+
+function toImageBlock(image: { url: string; detail?: string }): ContentBlock {
+  // Data URL: data:<media-type>;base64,<data>
+  const dataUrlMatch = image.url.match(/^data:([^;]+);base64,(.+)$/);
+  if (dataUrlMatch) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: dataUrlMatch[1],
+        data: dataUrlMatch[2],
+      },
+    };
+  }
+  return { type: "image", source: { type: "url", url: image.url } };
+}
+
 // ─── Prompt Building ────────────────────────────────────────────────────────
 
 export interface BuiltPrompt {

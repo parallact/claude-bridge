@@ -5,8 +5,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { debugLog, hashString, newRequestId } from "./debug-logger.js";
 import type { BridgeMcpHttpServer, McpTool } from "./mcp-http.js";
 import type { PersistentSessionPool } from "./session-pool.js";
+import type { ContentBlock } from "./translate.js";
 import {
   linesOf,
   parseStream,
@@ -88,17 +90,17 @@ export function isPathDEnabled(): boolean {
 /** Request shape for Path D. Distinct from CLIRequest because the persistent
  *  path handles continuations (tool_result injection) differently. */
 export interface PersistentCLIRequest {
-  sessionKey: string; // required — Path D needs a stable key
+  sessionKey: string;
   model: string;
   systemPrompt: string | undefined;
   tools: McpTool[];
-  /** The latest user text (for initial turn) or empty string (for
-   *  continuation where the "input" comes via resolveToolCall). */
-  lastUserText: string;
-  /** If present, this is a continuation: deliver this tool_result via the
-   *  bridge MCP before reading the next checkpoint. */
+  /** Content blocks for the latest user message (text, images, etc).
+   *  Empty array when this is a pure continuation. */
+  lastUserContent: ContentBlock[];
+  /** If present, deliver this tool_result via the bridge MCP before reading
+   *  the next checkpoint. Content is content-blocks (preserves structure). */
   pendingToolResult:
-    | { toolUseId: string; content: Array<Record<string, unknown>> | string }
+    | { toolUseId: string; content: ContentBlock[] }
     | null;
 }
 
@@ -141,6 +143,22 @@ export async function enqueuePersistent(
   return serializeOnSession(request.sessionKey, async () => {
     await acquireSlot();
     log("info", "PathD queue", { active: inFlight, waiting: waiters.length });
+    const requestId = newRequestId();
+    debugLog({
+      requestId,
+      phase: "request",
+      path: "pathD",
+      sessionKey: request.sessionKey,
+      model: request.model,
+      systemPromptLen: request.systemPrompt?.length ?? 0,
+      systemPromptHash: hashString(request.systemPrompt ?? ""),
+      tools: request.tools.map((t) => ({
+        name: t.name,
+        schemaHash: hashString(JSON.stringify(t.inputSchema)),
+      })),
+      lastUserContent: request.lastUserContent,
+      pendingToolResult: request.pendingToolResult,
+    });
     metrics.totalRequests++;
     const startedAt = Date.now();
     try {
@@ -162,7 +180,7 @@ export async function enqueuePersistent(
         );
       } else {
         // Initial: feed the user message to stdin.
-        session.sendUserMessage(request.lastUserText);
+        session.sendUserMessage(request.lastUserContent);
       }
 
       const cp = await session.nextCheckpoint(handlers, poolConfig.timeoutMs);
@@ -198,6 +216,18 @@ export async function enqueuePersistent(
       metrics.successes++;
       metrics.latencyMsSum += Date.now() - startedAt;
       metrics.latencyMsCount++;
+      debugLog({
+        requestId,
+        phase: "response",
+        path: "pathD",
+        stopReason,
+        hasToolCalls: toolCalls.length > 0,
+        toolCallNames: toolCalls.map((t) => t.name),
+        textLen: cp.text.length,
+        textPreview: cp.text.slice(0, 500),
+        inputTokens: cp.result?.inputTokens ?? 0,
+        outputTokens: cp.result?.outputTokens ?? 0,
+      });
       return {
         text: cp.text,
         toolCalls,
@@ -493,6 +523,23 @@ async function runCLI(
     promptLen: promptToSend.length,
   });
 
+  const requestId = newRequestId();
+  debugLog({
+    requestId,
+    phase: "request",
+    path: "legacy",
+    sessionKey: request.sessionKey,
+    model: request.model,
+    systemPromptLen: request.systemPrompt?.length ?? 0,
+    systemPromptHash: hashString(request.systemPrompt ?? ""),
+    tools: request.tools.map((t) => ({
+      name: t.name,
+      schemaHash: hashString(JSON.stringify(t.inputSchema)),
+    })),
+    prompt: promptToSend,
+    isNew,
+  });
+
   const proc = spawn("claude", args, {
     env: { ...process.env },
     stdio: ["pipe", "pipe", "pipe"],
@@ -541,6 +588,18 @@ async function runCLI(
       );
     }
 
+    debugLog({
+      requestId,
+      phase: "response",
+      path: "legacy",
+      stopReason,
+      hasToolCalls: toolCalls.length > 0,
+      toolCallNames: toolCalls.map((t) => t.name),
+      textLen: parsed.text.length,
+      textPreview: parsed.text.slice(0, 500),
+      inputTokens: parsed.inputTokens,
+      outputTokens: parsed.outputTokens,
+    });
     return {
       text: parsed.text,
       toolCalls,

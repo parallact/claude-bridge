@@ -32,6 +32,10 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { BridgeMcpHttpServer, CapturedToolUse, McpTool } from "./mcp-http.js";
 import { linesOf, parseStream, type StreamEventHandlers } from "./stream-parser.js";
+import { formatUserMessageLine } from "./user-message-format.js";
+export { formatUserMessageLine } from "./user-message-format.js";
+import type { ContentBlock } from "./translate.js";
+export type { ContentBlock } from "./translate.js";
 
 export interface SessionSpec {
   model: string;
@@ -141,14 +145,13 @@ class PersistentSession {
     return this._dead;
   }
 
-  /** Writes a user message to the CLI over stdin. */
-  sendUserMessage(text: string): void {
+  /** Writes a user message to the CLI over stdin. Accepts content blocks
+   *  so images and structured tool_result content are preserved. No-ops on
+   *  empty content (caller should pre-filter, but defensive). */
+  sendUserMessage(content: ContentBlock[]): void {
     if (this._dead) throw new Error("session is dead");
-    const line = JSON.stringify({
-      type: "user",
-      message: { role: "user", content: [{ type: "text", text }] },
-    });
-    this.proc.stdin?.write(`${line}\n`);
+    if (content.length === 0) return;
+    this.proc.stdin?.write(formatUserMessageLine(content));
     this.lastUsed = Date.now();
   }
 

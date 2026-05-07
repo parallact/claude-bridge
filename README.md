@@ -23,6 +23,11 @@ OpenClaw/Client → Claude Bridge (port 3456) → api.anthropic.com
 - **Vision support** — translates base64 image content between formats
 - **Docker-ready** — multi-stage Dockerfile, health check, graceful shutdown
 - **Zero runtime deps** — pure Node.js, no npm dependencies in production
+- **Path D persistent sessions** — when `user` is set, requests reuse a long-running `claude` CLI process via MCP-based structured tool calling; no subprocess spawning overhead on subsequent turns
+
+### Path D Priming (v3.4.0+)
+
+**Path D priming**: when a request arrives with `user` set and prior conversation history (more than one user/tool message), the bridge primes a fresh persistent CLI session by sending the full conversation history as the first user message. The model's response answers the user's latest question. Subsequent turns on the same session deliver only the incremental message via native tool_use/tool_result blocks — no XML pseudo-tag re-injection on every turn.
 
 ## Quick Start
 

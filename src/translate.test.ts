@@ -174,3 +174,58 @@ test("extractForPathD: anthropic-style tool_result in user message preserves str
     ],
   });
 });
+
+test("extractForPathD: single user message → primingPrompt undefined", () => {
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      { role: "system", content: "be helpful" },
+      { role: "user", content: "hola" },
+    ],
+  });
+  assert.ok(result);
+  assert.equal(result.primingPrompt, undefined);
+});
+
+test("extractForPathD: multi-turn history → primingPrompt populated with full XML history", () => {
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      { role: "system", content: "be helpful" },
+      { role: "user", content: "first question" },
+      { role: "assistant", content: "first answer" },
+      { role: "user", content: "second question" },
+    ],
+  });
+  assert.ok(result);
+  assert.ok(result.primingPrompt, "primingPrompt should be populated");
+  // Must include both user turns and the prior assistant turn
+  assert.ok(result.primingPrompt.includes("first question"));
+  assert.ok(result.primingPrompt.includes("first answer"));
+  assert.ok(result.primingPrompt.includes("second question"));
+  // System should NOT appear in primingPrompt (it's passed via --system-prompt)
+  assert.ok(!result.primingPrompt.includes("be helpful"));
+});
+
+test("extractForPathD: tool-result continuation also populates primingPrompt", () => {
+  // Even if the conversation has many turns, when the LATEST is a tool_result,
+  // primingPrompt is still computed (history count > 1). Whether to use it is
+  // enqueuePersistent's decision based on isFresh.
+  const result = extractForPathD({
+    model: "x",
+    messages: [
+      { role: "user", content: "do thing" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", content: "the result", tool_call_id: "call_1" },
+    ],
+  });
+  assert.ok(result);
+  assert.ok(result.primingPrompt);
+  assert.ok(result.pendingToolResult);
+});

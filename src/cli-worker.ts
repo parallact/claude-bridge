@@ -102,6 +102,9 @@ export interface PersistentCLIRequest {
   pendingToolResult:
     | { toolUseId: string; content: ContentBlock[] }
     | null;
+  /** XML-encoded full history. Used only when the persistent session is
+   *  fresh. Sent as the first user message INSTEAD of lastUserContent. */
+  primingPrompt: string | undefined;
 }
 
 function fingerprint(spec: {
@@ -144,33 +147,46 @@ export async function enqueuePersistent(
     await acquireSlot();
     log("info", "PathD queue", { active: inFlight, waiting: waiters.length });
     const requestId = newRequestId();
-    debugLog({
-      requestId,
-      phase: "request",
-      path: "pathD",
-      sessionKey: request.sessionKey,
-      model: request.model,
-      systemPromptLen: request.systemPrompt?.length ?? 0,
-      systemPromptHash: hashString(request.systemPrompt ?? ""),
-      tools: request.tools.map((t) => ({
-        name: t.name,
-        schemaHash: hashString(JSON.stringify(t.inputSchema)),
-      })),
-      lastUserContent: request.lastUserContent,
-      pendingToolResult: request.pendingToolResult,
-    });
     metrics.totalRequests++;
     const startedAt = Date.now();
     try {
       const spec_fp = fingerprint(request);
-      const session = sessionPool.acquire(request.sessionKey, {
+      const acquired = sessionPool.acquire(request.sessionKey, {
         model: request.model,
         tools: request.tools,
         systemPrompt: request.systemPrompt,
         spec_fp,
       });
+      const session = acquired.session;
+      const isFresh = acquired.isFresh;
+      debugLog({
+        requestId,
+        phase: "request",
+        path: "pathD",
+        sessionKey: request.sessionKey,
+        model: request.model,
+        systemPromptLen: request.systemPrompt?.length ?? 0,
+        systemPromptHash: hashString(request.systemPrompt ?? ""),
+        tools: request.tools.map((t) => ({
+          name: t.name,
+          schemaHash: hashString(JSON.stringify(t.inputSchema)),
+        })),
+        lastUserContent: request.lastUserContent,
+        pendingToolResult: request.pendingToolResult,
+        isFresh,
+        primingMode: isFresh && !!request.primingPrompt,
+        primingPromptLen: request.primingPrompt?.length ?? 0,
+      });
 
-      if (request.pendingToolResult) {
+      if (isFresh && request.primingPrompt) {
+        // First turn on a fresh session that has prior history. Send the full
+        // XML-encoded history as one user message — the model's response IS the
+        // answer to the user's latest question (which is included in the blob).
+        // Subsequent turns are incremental + native.
+        session.sendUserMessage([
+          { type: "text", text: request.primingPrompt },
+        ]);
+      } else if (request.pendingToolResult) {
         // Continuation: resolve the parked MCP tools/call, then read events
         // until the next significant checkpoint.
         mcpServer.resolveToolCall(

@@ -203,6 +203,14 @@ export interface PathDExtracted {
   pendingToolResult:
     | { toolUseId: string; content: ContentBlock[] }
     | null;
+  /** When set, the persistent session is being acquired against a request
+   *  whose history has more than one user/tool turn. If the session is
+   *  fresh, send this XML-encoded blob as the first user message instead
+   *  of `lastUserContent`. The model's response IS the response to the
+   *  user's latest question (the blob includes the latest user message
+   *  inline via buildPrompt). On the next turn, history is in the
+   *  persistent session's internal state and we go incremental. */
+  primingPrompt: string | undefined;
 }
 
 /**
@@ -229,6 +237,10 @@ export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
   const systemPrompt =
     systemParts.length > 0 ? systemParts.join("\n\n") : undefined;
 
+  const nonSystemCount = oai.messages.filter((m) => m.role !== "system").length;
+  const primingPrompt =
+    nonSystemCount > 1 ? buildPrompt(oai).prompt : undefined;
+
   const last = oai.messages[oai.messages.length - 1];
   if (!last) return null;
 
@@ -242,6 +254,7 @@ export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
         toolUseId,
         content: toContentBlocks(last.content),
       },
+      primingPrompt,
     };
   }
 
@@ -268,6 +281,7 @@ export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
             systemPrompt,
             lastUserContent: [],
             pendingToolResult: { toolUseId: part.tool_use_id, content },
+            primingPrompt,
           };
         }
       }
@@ -276,6 +290,7 @@ export function extractForPathD(oai: OAIChatRequest): PathDExtracted | null {
       systemPrompt,
       lastUserContent: toContentBlocks(last.content),
       pendingToolResult: null,
+      primingPrompt,
     };
   }
 

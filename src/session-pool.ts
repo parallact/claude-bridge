@@ -36,6 +36,7 @@ import { formatUserMessageLine } from "./user-message-format.js";
 export { formatUserMessageLine } from "./user-message-format.js";
 import type { ContentBlock } from "./translate.js";
 export type { ContentBlock } from "./translate.js";
+import { decideSessionAction } from "./session-pool-decision.js";
 
 export interface SessionSpec {
   model: string;
@@ -374,17 +375,26 @@ export class PersistentSessionPool {
     this.evictTimer.unref();
   }
 
-  /** Get an existing session for this key if compatible, else respawn. */
-  acquire(sessionKey: string, spec: SessionSpec): PersistentSession {
+  /** Get an existing session for this key if compatible, else respawn.
+   *  Returns `{ session, isFresh }` — callers use `isFresh` to decide
+   *  whether a system-prompt injection is needed on the first turn. */
+  acquire(sessionKey: string, spec: SessionSpec): { session: PersistentSession; isFresh: boolean } {
     const existing = this.sessions.get(sessionKey);
-    if (existing && !existing.dead && existing.spec_fp === spec.spec_fp) {
-      if (Date.now() - existing.createdAt > this.config.maxLifetimeMs) {
-        this.teardown(sessionKey);
-      } else {
-        existing.lastUsed = Date.now();
-        return existing;
-      }
-    } else if (existing) {
+    const decision = decideSessionAction({
+      existing: existing
+        ? { dead: existing.dead, specFp: existing.spec_fp, createdAt: existing.createdAt }
+        : undefined,
+      specFp: spec.spec_fp,
+      config: this.config,
+      now: Date.now(),
+    });
+
+    if (decision.action === "reuse" && existing) {
+      existing.lastUsed = Date.now();
+      return { session: existing, isFresh: false };
+    }
+
+    if (decision.action === "respawn" && existing) {
       this.teardown(sessionKey);
     }
 
@@ -401,7 +411,7 @@ export class PersistentSessionPool {
       if (oldestKey) this.teardown(oldestKey);
     }
 
-    return this.spawnNew(sessionKey, spec);
+    return { session: this.spawnNew(sessionKey, spec), isFresh: true };
   }
 
   /** Explicit teardown. */

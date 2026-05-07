@@ -16,7 +16,7 @@ import {
 import type { OAIChatRequest } from "./translate.js";
 import { buildPrompt, extractForPathD, toolsFromRequest } from "./translate.js";
 
-const BRIDGE_VERSION = "3.3.0";
+const BRIDGE_VERSION = "3.4.0";
 
 // Flipped to true on SIGTERM/SIGINT so new chat-completion requests get
 // rejected with 503 while we drain. Health + models stay up for LB checks.
@@ -232,6 +232,7 @@ async function handleChatCompletions(
       tools,
       lastUserContent: pathD.lastUserContent,
       pendingToolResult: pathD.pendingToolResult,
+      primingPrompt: pathD.primingPrompt,
     };
     if (oaiReq.stream) {
       await handlePersistentStreaming(req, res, persistentReq, model.id, startTime);

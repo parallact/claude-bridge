@@ -151,14 +151,15 @@ export async function enqueuePersistent(
     const startedAt = Date.now();
     try {
       const spec_fp = fingerprint(request);
-      const acquired = sessionPool.acquire(request.sessionKey, {
+      const acquireSpec = {
         model: request.model,
         tools: request.tools,
         systemPrompt: request.systemPrompt,
         spec_fp,
-      });
-      const session = acquired.session;
-      const isFresh = acquired.isFresh;
+      };
+      const acquired = sessionPool.acquire(request.sessionKey, acquireSpec);
+      let session = acquired.session;
+      let isFresh = acquired.isFresh;
       debugLog({
         requestId,
         phase: "request",
@@ -187,13 +188,42 @@ export async function enqueuePersistent(
           { type: "text", text: request.primingPrompt },
         ]);
       } else if (request.pendingToolResult) {
-        // Continuation: resolve the parked MCP tools/call, then read events
-        // until the next significant checkpoint.
-        mcpServer.resolveToolCall(
+        // Continuation: try to resolve the parked MCP tools/call. If the
+        // pending entry is missing (orphan — bridge restart, CLI death,
+        // or session eviction between matrix receiving the tool_use and
+        // sending the tool_result back), tear down the broken session and
+        // re-prime with the full conversation history. The caller's
+        // tool_result is included inside the priming XML blob, so the
+        // model still sees it as conversational context.
+        const resolved = mcpServer.tryResolveToolCall(
           request.sessionKey,
           request.pendingToolResult.toolUseId,
           request.pendingToolResult.content,
         );
+        if (!resolved) {
+          if (!request.primingPrompt) {
+            // No priming context to recover with. Surface the original
+            // error so the caller knows the session is unrecoverably
+            // broken for this tool_result. Matrix-style retry will hit
+            // the same error; right operator action is to reset.
+            throw new Error(
+              `no pending tool call: ${request.pendingToolResult.toolUseId}`,
+            );
+          }
+          log("warn", "Orphan tool_result — respawning + re-priming", {
+            sessionKey: request.sessionKey,
+            toolUseId: request.pendingToolResult.toolUseId,
+            requestId,
+          });
+          metrics.orphanRecoveries++;
+          sessionPool.teardown(request.sessionKey);
+          const reAcquired = sessionPool.acquire(request.sessionKey, acquireSpec);
+          session = reAcquired.session;
+          isFresh = reAcquired.isFresh;
+          session.sendUserMessage([
+            { type: "text", text: request.primingPrompt },
+          ]);
+        }
       } else {
         // Initial: feed the user message to stdin.
         session.sendUserMessage(request.lastUserContent);
@@ -648,6 +678,11 @@ const metrics = {
   successes: 0,
   failures: 0,
   retries: 0,
+  // Path D orphan tool_result recoveries: matrix delivered a tool_result
+  // for a toolUseId the bridge no longer has pending (bridge restart, CLI
+  // death, session eviction). We tear down + respawn + re-prime instead of
+  // surfacing a 500. This counter shows how often that path is taken.
+  orphanRecoveries: 0,
   // Latency running sum + count (in ms). Simpler than a histogram and good
   // enough for p50-ish reporting. If we ever care about tail latency we'd
   // plug in a real HDR histogram.
@@ -663,6 +698,7 @@ export interface BridgeMetrics {
   successes: number;
   failures: number;
   retries: number;
+  orphanRecoveries: number;
   avgLatencyMs: number | null;
   inFlight: number;
   waiting: number;
@@ -678,6 +714,7 @@ export function getMetrics(): BridgeMetrics {
     successes: metrics.successes,
     failures: metrics.failures,
     retries: metrics.retries,
+    orphanRecoveries: metrics.orphanRecoveries,
     avgLatencyMs:
       metrics.latencyMsCount === 0
         ? null

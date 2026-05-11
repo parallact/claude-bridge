@@ -108,6 +108,13 @@ class PersistentSession {
   private pendingText = "";
   /** Reader promise; rejects on stream error. */
   private readerDone: Promise<void>;
+  /** Accumulated stderr from the CLI process. Capped at 4KB to avoid
+   *  unbounded growth on chatty errors. Surfaced on proc.close to help
+   *  diagnose why the CLI exited. */
+  private stderrCapture = "";
+  private static readonly STDERR_CAP = 4096;
+  /** Snapshot of significant lifecycle events, logged when proc closes. */
+  private lifecycle: Array<{ ts: number; event: string }> = [];
 
   constructor(args: {
     sessionKey: string;
@@ -126,8 +133,39 @@ class PersistentSession {
     this.createdAt = Date.now();
     this.lastUsed = this.createdAt;
 
-    this.proc.once("close", () => {
+    // Capture stderr so we can surface it on unexpected exit.
+    if (this.proc.stderr) {
+      this.proc.stderr.setEncoding("utf-8");
+      this.proc.stderr.on("data", (chunk: string) => {
+        const remaining = PersistentSession.STDERR_CAP - this.stderrCapture.length;
+        if (remaining <= 0) return;
+        this.stderrCapture += chunk.slice(0, remaining);
+      });
+    }
+
+    this.proc.once("close", (code, signal) => {
       this._dead = true;
+      const lifetimeMs = Date.now() - this.createdAt;
+      const stderrSnippet = this.stderrCapture.trim().slice(-1024);
+      // Diagnostic: when a "persistent" session exits, log enough to
+      // distinguish the failure modes (normal exit vs killed vs error).
+      // This is critical because Path D's promise of persistence is broken
+      // if CLIs exit between turns — every exit forces a respawn.
+      const entry = {
+        ts: new Date().toISOString(),
+        level: "info",
+        msg: "PathD CLI close",
+        sessionKey: this.sessionKey,
+        sessionId: this.sessionId.slice(0, 8),
+        pid: this.proc.pid,
+        code,
+        signal,
+        lifetimeMs,
+        lifecycle: this.lifecycle,
+        stderrLen: this.stderrCapture.length,
+        stderrTail: stderrSnippet,
+      };
+      process.stdout.write(`${JSON.stringify(entry)}\n`);
       // Unblock any pending read so consumers don't hang.
       if (this.pendingRead) {
         const cb = this.pendingRead;
@@ -142,6 +180,13 @@ class PersistentSession {
     this.readerDone.catch(() => {});
   }
 
+  /** Internal: record a lifecycle event for the close-time diagnostic log. */
+  private mark(event: string): void {
+    this.lifecycle.push({ ts: Date.now() - this.createdAt, event });
+    // Bound to last 20 events; we only care about recent context.
+    if (this.lifecycle.length > 20) this.lifecycle.shift();
+  }
+
   get dead(): boolean {
     return this._dead;
   }
@@ -154,6 +199,7 @@ class PersistentSession {
     if (content.length === 0) return;
     this.proc.stdin?.write(formatUserMessageLine(content));
     this.lastUsed = Date.now();
+    this.mark(`sendUserMessage(${content.length} blocks)`);
   }
 
   /** Reads events from the stream until the next tool_use or result.
@@ -302,6 +348,7 @@ class PersistentSession {
             typeof block.id === "string" &&
             typeof block.name === "string"
           ) {
+            this.mark(`stream:tool_use(${(block.id as string).slice(0, 12)})`);
             this.emit({
               type: "tool_use",
               tu: {
@@ -323,6 +370,7 @@ class PersistentSession {
         // The CLI echoes back the user message it just consumed (the real
         // tool_result delivered via MCP). Path D doesn't need to surface
         // that to the caller — they already know what they sent us.
+        this.mark("stream:user_echo");
         continue;
       }
       if (type === "result") {
@@ -330,6 +378,9 @@ class PersistentSession {
         const isError = evt.is_error === true;
         const errs = evt.errors as string[] | undefined;
         const errorMessage = isError ? (errs?.[0] ?? (typeof evt.result === "string" ? (evt.result as string) : undefined)) : undefined;
+        this.mark(
+          `stream:result(stop=${stopReason}${isError ? ",ERR" : ""})`,
+        );
         this.emit({
           type: "result",
           result: {
@@ -347,6 +398,7 @@ class PersistentSession {
         rateLimitStatus = undefined;
       }
     }
+    this.mark("stream:closed");
   }
 }
 

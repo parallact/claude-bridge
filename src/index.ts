@@ -1,4 +1,4 @@
-import { startServer } from "./server.js";
+import { BRIDGE_VERSION, startServer } from "./server.js";
 import {
   cleanupStaleTempFiles,
   configurePathD,
@@ -56,7 +56,7 @@ const sessionPool = new PersistentSessionPool({
 configurePathD({ enabled: pathDEnabled, mcpServer, sessionPool });
 
 console.log("╔══════════════════════════════════════════╗");
-console.log("║        Claude Bridge v3.3.0              ║");
+console.log(`║        Claude Bridge v${BRIDGE_VERSION}              ║`);
 console.log("║  OpenAI ↔ Claude CLI + MCP tools         ║");
 console.log("╚══════════════════════════════════════════╝");
 console.log("");

@@ -169,11 +169,29 @@ export class BridgeMcpHttpServer {
   /** Deliver a real tool_result to a previously-captured tool_use. Causes
    *  the parked HTTP response to flush, unblocking the CLI. */
   resolveToolCall(sessionKey: string, toolUseId: string, content: unknown): void {
+    if (!this.tryResolveToolCall(sessionKey, toolUseId, content)) {
+      throw new Error(`no pending tool call: ${toolUseId}`);
+    }
+  }
+
+  /** Try to deliver a tool_result. Returns true on success, false if the
+   *  pending entry is missing (e.g. bridge restarted, CLI died, or session
+   *  was respawned between turns). Callers use this to detect orphan
+   *  tool_result deliveries and recover (typically by respawning the
+   *  session and re-priming with the full conversation history). */
+  tryResolveToolCall(
+    sessionKey: string,
+    toolUseId: string,
+    content: unknown,
+  ): boolean {
     const ctx = this.sessions.get(sessionKey);
-    if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
+    if (!ctx) return false;
     const pending = ctx.pending.get(toolUseId);
-    if (!pending) throw new Error(`no pending tool call: ${toolUseId}`);
-    if (pending.resolved) return;
+    if (!pending) return false;
+    if (pending.resolved) {
+      ctx.pending.delete(toolUseId);
+      return true;
+    }
     this.finishResponse(pending, {
       result: {
         content: this.normalizeContent(content),
@@ -181,6 +199,7 @@ export class BridgeMcpHttpServer {
       },
     });
     ctx.pending.delete(toolUseId);
+    return true;
   }
 
   /** Deliver an error result so the CLI sees the tool failed. */

@@ -314,12 +314,38 @@ export class BridgeMcpHttpServer {
       receivedAt: Date.now(),
     };
     ctx.pending.set(toolUseId, pending);
+    process.stdout.write(
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "info",
+        msg: "MCP tools/call pending",
+        sessionKey: ctx.sessionKey,
+        toolUseId,
+        tool: name,
+      })}\n`,
+    );
 
     // If the client socket dies, drop the pending entry so we don't leak.
     res.once("close", () => {
       if (!pending.resolved) {
         pending.resolved = true;
         ctx.pending.delete(toolUseId);
+        const ageMs = Date.now() - pending.receivedAt;
+        // CRITICAL diagnostic: when the parked MCP response socket closes
+        // before the bridge has had a chance to deliver a tool_result, the
+        // pending entry is silently deleted. Matrix's later tool_result
+        // delivery then hits "no pending tool call". Capture the age so
+        // we can see how quickly the CLI is bailing on parked responses.
+        process.stdout.write(
+          `${JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "warn",
+            msg: "MCP pending CLOSED before resolve",
+            sessionKey: ctx.sessionKey,
+            toolUseId,
+            ageMs,
+          })}\n`,
+        );
       }
     });
 

@@ -220,6 +220,18 @@ export class BridgeMcpHttpServer {
   // ─── HTTP handling ──────────────────────────────────────────────────────
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // DIAGNOSTIC: log all incoming requests with method + accept header
+    process.stdout.write(
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "info",
+        msg: "MCP HTTP request",
+        method: req.method,
+        url: req.url,
+        accept: req.headers.accept,
+        contentType: req.headers["content-type"],
+      })}\n`,
+    );
     // CLI does a GET for SSE on the same URL as part of MCP HTTP transport
     // discovery; we don't need streaming, so reply with 405.
     if (req.method === "GET") {

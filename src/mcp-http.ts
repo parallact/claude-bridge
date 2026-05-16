@@ -41,6 +41,10 @@ interface PendingCall {
   res: ServerResponse;
   resolved: boolean;
   receivedAt: number;
+  /** Monotonic counter per-process. Lets us distinguish "POST1 vs POST2"
+   *  in close logs when the CLI sends two tools/call POSTs with the same
+   *  toolUseId (observed in production — root cause TBD). */
+  seq: number;
   /** True when the CLI requested SSE (Accept includes text/event-stream).
    *  Headers were written immediately on receipt so the socket transitions
    *  out of "waiting for first byte" and the CLI's pre-byte timeout never
@@ -49,6 +53,8 @@ interface PendingCall {
    *  is true the response CANNOT fall back to plain JSON. */
   isSse: boolean;
 }
+
+let pendingSeq = 0;
 
 interface ToolCallWaiter {
   resolve: (call: CapturedToolUse) => void;
@@ -355,14 +361,22 @@ export class BridgeMcpHttpServer {
       res.write(": waiting for tool_result\n\n");
     }
 
+    const seq = ++pendingSeq;
     const pending: PendingCall = {
       toolUseId,
       rpcId,
       res,
       resolved: false,
       receivedAt: Date.now(),
+      seq,
       isSse,
     };
+    // If a previous pending with the same toolUseId exists (CLI sent a
+    // duplicate POST), preserve its socket but stop tracking it in the map.
+    // The new pending becomes the canonical one for tryResolveToolCall.
+    // We do NOT close the old socket here — it may still receive a result
+    // if the CLI is actually listening on it; let it die naturally.
+    const prior = ctx.pending.get(toolUseId);
     ctx.pending.set(toolUseId, pending);
     process.stdout.write(
       `${JSON.stringify({
@@ -371,32 +385,47 @@ export class BridgeMcpHttpServer {
         msg: "MCP tools/call pending",
         sessionKey: ctx.sessionKey,
         toolUseId,
+        rpcId,
+        seq,
         tool: name,
+        isSse,
+        priorSeq: prior?.seq ?? null,
+        priorResolved: prior?.resolved ?? null,
       })}\n`,
     );
 
-    // If the client socket dies, drop the pending entry so we don't leak.
+    // If the client socket dies, drop the pending entry — but ONLY if the
+    // map still points to this exact pending. With duplicate POSTs (same
+    // toolUseId), POST1's close handler must NOT delete POST2's entry from
+    // the map. That race was silently dropping pending entries in
+    // production and caused ~50% orphanRecoveries.
     res.once("close", () => {
+      const ageMs = Date.now() - pending.receivedAt;
+      const stillInMap = ctx.pending.get(toolUseId) === pending;
+      const wasResolved = pending.resolved;
       if (!pending.resolved) {
         pending.resolved = true;
-        ctx.pending.delete(toolUseId);
-        const ageMs = Date.now() - pending.receivedAt;
-        // CRITICAL diagnostic: when the parked MCP response socket closes
-        // before the bridge has had a chance to deliver a tool_result, the
-        // pending entry is silently deleted. Matrix's later tool_result
-        // delivery then hits "no pending tool call". Capture the age so
-        // we can see how quickly the CLI is bailing on parked responses.
-        process.stdout.write(
-          `${JSON.stringify({
-            ts: new Date().toISOString(),
-            level: "warn",
-            msg: "MCP pending CLOSED before resolve",
-            sessionKey: ctx.sessionKey,
-            toolUseId,
-            ageMs,
-          })}\n`,
-        );
+        if (stillInMap) ctx.pending.delete(toolUseId);
       }
+      // Always log close events so we can see what happens to BOTH sockets
+      // when the CLI duplicates POSTs. This is intentionally noisy until
+      // the root cause of duplicate POSTs is understood; trim once stable.
+      process.stdout.write(
+        `${JSON.stringify({
+          ts: new Date().toISOString(),
+          level: wasResolved ? "info" : "warn",
+          msg: wasResolved ? "MCP pending close (already resolved)" : "MCP pending CLOSED before resolve",
+          sessionKey: ctx.sessionKey,
+          toolUseId,
+          rpcId,
+          seq,
+          ageMs,
+          headersSent: res.headersSent,
+          writableEnded: res.writableEnded,
+          stillInMap,
+          isSse,
+        })}\n`,
+      );
     });
 
     const captured: CapturedToolUse = { toolUseId, name, args };

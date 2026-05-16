@@ -41,6 +41,13 @@ interface PendingCall {
   res: ServerResponse;
   resolved: boolean;
   receivedAt: number;
+  /** True when the CLI requested SSE (Accept includes text/event-stream).
+   *  Headers were written immediately on receipt so the socket transitions
+   *  out of "waiting for first byte" and the CLI's pre-byte timeout never
+   *  fires while the bridge parks the response. The final tool_result is
+   *  written as a single `data:` SSE event followed by res.end(). Once this
+   *  is true the response CANNOT fall back to plain JSON. */
+  isSse: boolean;
 }
 
 interface ToolCallWaiter {
@@ -283,7 +290,7 @@ export class BridgeMcpHttpServer {
     }
 
     if (method === "tools/call") {
-      await this.handleToolsCall(ctx, msg, res);
+      await this.handleToolsCall(ctx, msg, res, req);
       return;
     }
 
@@ -300,6 +307,7 @@ export class BridgeMcpHttpServer {
     ctx: SessionContext,
     msg: Record<string, unknown>,
     res: ServerResponse,
+    req: IncomingMessage,
   ): Promise<void> {
     const rpcId = msg.id as number | string | undefined;
     const params = (msg.params ?? {}) as Record<string, unknown>;
@@ -318,12 +326,42 @@ export class BridgeMcpHttpServer {
       return;
     }
 
+    // Per MCP Streamable HTTP transport spec, the CLI sends
+    // `Accept: application/json, text/event-stream` — the server picks
+    // which protocol to use. If we reply with plain JSON, the CLI parks
+    // the socket waiting for response headers. Bun's HTTP client closes
+    // that pre-byte wait at ~500ms regardless of MCP_TIMEOUT or
+    // BUN_CONFIG_HTTP_IDLE_TIMEOUT (which only governs *idle* sockets,
+    // not "waiting for first byte"). By choosing SSE and writing
+    // 200 + Content-Type: text/event-stream + a comment frame
+    // immediately, the socket transitions to "actively streaming" and
+    // the parked tools/call response stays alive until the bridge has a
+    // real tool_result to deliver (via finishResponse → `data:` event).
+    const acceptHeader = (req.headers.accept ?? "").toString().toLowerCase();
+    const isSse = acceptHeader.includes("text/event-stream");
+    if (isSse) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        // Disable nginx-style proxy buffering just in case anything sits
+        // in front of us in dev/test setups. In-process this is a no-op.
+        "X-Accel-Buffering": "no",
+      });
+      // SSE comment line. Flushes headers to the client and pumps the
+      // first byte so the CLI's pre-byte timeout never fires. Once we've
+      // written headers we're committed to SSE — finishResponse must
+      // emit a `data:` event, not a JSON body.
+      res.write(": waiting for tool_result\n\n");
+    }
+
     const pending: PendingCall = {
       toolUseId,
       rpcId,
       res,
       resolved: false,
       receivedAt: Date.now(),
+      isSse,
     };
     ctx.pending.set(toolUseId, pending);
     process.stdout.write(
@@ -418,7 +456,19 @@ export class BridgeMcpHttpServer {
   private finishResponse(pending: PendingCall, body: Record<string, unknown>): void {
     pending.resolved = true;
     try {
-      this.writeJson(pending.res, 200, { jsonrpc: "2.0", id: pending.rpcId, ...body });
+      const payload = { jsonrpc: "2.0", id: pending.rpcId, ...body };
+      if (pending.isSse) {
+        // Headers were already written when the call arrived. Emit the
+        // final result as a single SSE data event then close — per MCP
+        // Streamable HTTP transport spec, the server MAY close the stream
+        // after sending its response message. We don't reuse the stream
+        // for further events.
+        const json = JSON.stringify(payload);
+        pending.res.write(`data: ${json}\n\n`);
+        pending.res.end();
+      } else {
+        this.writeJson(pending.res, 200, payload);
+      }
     } catch {
       // Socket already closed — nothing to do, pending is already flagged.
     }
